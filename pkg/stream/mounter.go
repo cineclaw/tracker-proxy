@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tracker-proxy/pkg/aggregator"
 )
 
 type HashResolver interface {
@@ -197,15 +198,19 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 	log.Printf("[mounter] MountTorrent requested: title=%q tconst=%q type=%q season=%d mode=%q version=%q folder=%q",
 		req.Title, req.Tconst, req.Type, req.Season, req.Mode, req.VersionName, req.FolderName)
 
-	// 0. Resolve missing magnet link if torrent_id and tracker are provided
+	// 0. Resolve missing magnet link or enrich existing magnet with announce trackers
 	if req.Magnet == "" && req.TorrentID != "" {
 		if m.hashResolver != nil && req.Tracker != "" {
 			hash, err := m.hashResolver.ResolveInfoHash(ctx, req.Tracker, req.TorrentID)
 			if err != nil {
 				log.Printf("[mounter] failed to resolve info_hash for %s:%s: %v", req.Tracker, req.TorrentID, err)
 			} else if hash != "" {
-				req.Magnet = fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=%s", hash, url.QueryEscape(req.Title))
+				req.Magnet = aggregator.BuildMultiTrackerMagnet(hash, req.Title, nil, []string{req.Tracker})
 			}
+		}
+	} else if req.Magnet != "" {
+		if h := extractInfoHashFromMagnet(req.Magnet); h != "" {
+			req.Magnet = aggregator.BuildMultiTrackerMagnet(h, req.Title, []string{req.Magnet}, []string{req.Tracker})
 		}
 	}
 
@@ -222,8 +227,8 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 		return nil, fmt.Errorf("gostorm add failed: %w", err)
 	}
 
-	// 2. Poll until metadata & file_stats are ready (up to 15s)
-	details, err := m.waitForTorrentFiles(ctx, hash, 15*time.Second)
+	// 2. Poll until metadata & file_stats are ready (up to 35s)
+	details, err := m.waitForTorrentFiles(ctx, hash, 35*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch torrent metadata: %w", err)
 	}
@@ -407,16 +412,21 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 		}
 
 		movieMeta := m.fetchMovieMetadata(ctx, req.Tconst)
-		if movieMeta != nil {
-			if req.Title == "" && movieMeta.Title != "" {
-				req.Title = movieMeta.Title
-			}
+		displayTitle := req.Title
+		if req.RuTitle != "" && containsCyrillic(req.RuTitle) {
+			displayTitle = req.RuTitle
+		} else if movieMeta != nil && movieMeta.Title != "" && containsCyrillic(movieMeta.Title) {
+			displayTitle = movieMeta.Title
+		} else if containsCyrillic(req.Title) {
+			displayTitle = req.Title
 		}
 
 		// Write .nfo in library directory
 		nfoPath := filepath.Join(libDir, fmt.Sprintf("%s%s.nfo", cleanTitle, yearSuffix))
-		writeMovieNFO(nfoPath, req.Title, req.Year, req.Tconst, movieMeta)
-		writeMovieNFO(filepath.Join(libDir, "movie.nfo"), req.Title, req.Year, req.Tconst, movieMeta)
+		writeMovieNFO(nfoPath, displayTitle, req.Year, req.Tconst, movieMeta)
+		writeMovieNFO(filepath.Join(libDir, "movie.nfo"), displayTitle, req.Year, req.Tconst, movieMeta)
+		baseMkvName := strings.TrimSuffix(mkvName, filepath.Ext(mkvName))
+		writeMovieNFO(filepath.Join(libDir, fmt.Sprintf("%s.nfo", baseMkvName)), displayTitle, req.Year, req.Tconst, movieMeta)
 
 		// Download poster, backdrop, logo
 		var imgTasks []imageDownloadTask
@@ -477,8 +487,16 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 		}
 
 		// Write tvshow.nfo in library directory
+		displayTitle := req.Title
+		if req.RuTitle != "" && containsCyrillic(req.RuTitle) {
+			displayTitle = req.RuTitle
+		} else if showMeta != nil && showMeta.Name != "" && containsCyrillic(showMeta.Name) {
+			displayTitle = showMeta.Name
+		} else if containsCyrillic(req.Title) {
+			displayTitle = req.Title
+		}
 		tvshowNFO := filepath.Join(seriesLibDir, "tvshow.nfo")
-		writeShowNFO(tvshowNFO, req.Title, origTitle, req.Year, req.Tconst, showMeta)
+		writeShowNFO(tvshowNFO, displayTitle, origTitle, req.Year, req.Tconst, showMeta)
 
 		var imgTasks []imageDownloadTask
 
@@ -757,6 +775,23 @@ func (m *Mounter) addTorrentToGoStorm(ctx context.Context, magnet, title string)
 		return "", fmt.Errorf("no hash returned by gostorm and unable to parse from magnet")
 	}
 	return strings.ToLower(res.Hash), nil
+}
+
+func extractInfoHashFromMagnet(magnet string) string {
+	re := regexp.MustCompile(`(?i)urn:btih:([a-f0-9]{40})`)
+	if matches := re.FindStringSubmatch(magnet); len(matches) > 1 {
+		return strings.ToLower(matches[1])
+	}
+	return ""
+}
+
+func containsCyrillic(s string) bool {
+	for _, r := range s {
+		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Mounter) waitForTorrentFiles(ctx context.Context, hash string, timeout time.Duration) (*TorrentDetails, error) {

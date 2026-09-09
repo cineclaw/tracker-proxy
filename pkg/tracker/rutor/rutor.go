@@ -56,7 +56,9 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, nil
 	}
 
-	searchURL := fmt.Sprintf("%s/search/0/0/0/0/%s", t.baseURL, url.PathEscape(query.Query))
+	// RuTor URL params: /search/page/category/xml/sort/query
+	// sort: 0 = date desc, 2 = seeds desc, 4 = leeches desc, 8 = size desc
+	searchURL := fmt.Sprintf("%s/search/0/0/0/2/%s", t.baseURL, url.PathEscape(query.Query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
 	if err != nil {
 		return nil, err
@@ -81,17 +83,23 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to parse rutor html: %w", err)
 	}
 
+	var nonVideoRegex = regexp.MustCompile(`(?i)(\b(flac|lossless|alac|ape|soundtrack|ost|audiobook|аудиокнига|repack by|gog|pc game|crack|patch|pdf|fb2|epub|djvu)\b|\[(flac|mp3|lossless|pc|iso|android|ios)\])`)
 	var results []models.TorrentResult
 
 	doc.Find("div#index table tr").Each(func(i int, s *goquery.Selection) {
+
 		titleLink := s.Find("a[href^='/torrent/']")
 		if titleLink.Length() == 0 {
 			return // header or notice row
 		}
 
 		title := strings.TrimSpace(titleLink.Text())
+		if nonVideoRegex.MatchString(title) {
+			return // skip music, books, games, software
+		}
 		href, _ := titleLink.Attr("href")
 		detailsURL := t.baseURL + href
+
 
 		// Extract Torrent ID from /torrent/123456/...
 		id := ""

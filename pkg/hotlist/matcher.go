@@ -124,6 +124,10 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 			if shouldUpgradeQuality(existing.Quality, t.Quality) {
 				existing.Quality = t.Quality
 			}
+			newRes := determineResolution(t.Quality)
+			if newRes == "4k" || existing.Resolution == "" {
+				existing.Resolution = determineResolution(existing.Quality)
+			}
 		} else {
 			id := i + 1
 			item := &Item{
@@ -141,12 +145,14 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 				Leeches:       t.Leeches,
 				Tracker:       t.Tracker,
 				Quality:       t.Quality,
+				Resolution:    determineResolution(t.Quality),
 				TorrentCount:  1,
 			}
 			grouped[groupKey] = item
 			order = append(order, groupKey)
 		}
 	}
+
 
 	// Collect items
 	result := make([]Item, 0, len(grouped))
@@ -245,3 +251,18 @@ func shouldUpgradeQuality(current, candidate string) bool {
 	}
 	return score(candidate) > score(current)
 }
+
+func determineResolution(quality string) string {
+	q := strings.ToUpper(quality)
+	if strings.Contains(q, "2160P") || strings.Contains(q, "4K") || strings.Contains(q, "UHD") {
+		return "4k"
+	}
+	if strings.Contains(q, "1080P") || strings.Contains(q, "FHD") {
+		return "1080p"
+	}
+	if strings.Contains(q, "720P") || strings.Contains(q, "HD") {
+		return "720p"
+	}
+	return "lq"
+}
+

@@ -135,6 +135,50 @@ func (t *Tracker) Login(ctx context.Context) error {
 	return nil
 }
 
+var (
+	nnmMovieForums = []int{
+		954, 219, 1296, 227, 882, 225, 221, 1177, 912, 909, 884, 1150,
+		1345, 1346, 891, 889, 682, 694, 1299, 1313, 1312, 1330, 1332,
+		1337, 1339, 620, 624, 628,
+	}
+
+	nnmSeriesForums = []int{
+		768, 769, 1219, 1221, 1220, 1344, 1265, 784, 774, 770, 780,
+		781, 1300, 1322, 658, 232, 620, 624, 628,
+	}
+)
+
+func buildNNMForumFilter(mediaType string) string {
+	var targetForums []int
+	lower := strings.ToLower(strings.TrimSpace(mediaType))
+	switch lower {
+	case "movie":
+		targetForums = nnmMovieForums
+	case "tv", "tvseries", "series":
+		targetForums = nnmSeriesForums
+	default:
+		seen := make(map[int]bool)
+		for _, f := range nnmMovieForums {
+			if !seen[f] {
+				seen[f] = true
+				targetForums = append(targetForums, f)
+			}
+		}
+		for _, f := range nnmSeriesForums {
+			if !seen[f] {
+				seen[f] = true
+				targetForums = append(targetForums, f)
+			}
+		}
+	}
+
+	var sb strings.Builder
+	for _, f := range targetForums {
+		sb.WriteString(fmt.Sprintf("&f%%5B%%5D=%d", f))
+	}
+	return sb.String()
+}
+
 func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]models.TorrentResult, error) {
 	if !t.enabled {
 		return nil, nil
@@ -151,13 +195,15 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to encode query to CP1251: %w", err)
 	}
 
+	forumFilter := buildNNMForumFilter(query.Type)
 	searchURL := fmt.Sprintf("%s/forum/tracker.php", t.baseURL)
-	postBody := fmt.Sprintf("f%%5B%%5D=-1&o=1&s=2&tm=-1&shf=1&sha=1&ta=-1&sns=-1&sds=-1&nm=%s&submit=%%CF%%EE%%E8%%F1%%EA", queryEncoded)
+	postBody := fmt.Sprintf("o=1&s=2&tm=-1&shf=1&sha=1&ta=-1&sns=-1&sds=-1%s&nm=%s&submit=%%CF%%EE%%E8%%F1%%EA", forumFilter, queryEncoded)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, searchURL, strings.NewReader(postBody))
 	if err != nil {
 		return nil, err
 	}
+
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")

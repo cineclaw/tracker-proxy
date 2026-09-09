@@ -41,8 +41,10 @@ type TorrentResult struct {
 // SearchQuery represents the search parameters.
 type SearchQuery struct {
 	Query        string
+	Type         string // "movie", "tv", "tvSeries", etc.
 	IMDbID       string
 	RefreshCache bool
 	Categories   []string
 	Limit        int
 }
+

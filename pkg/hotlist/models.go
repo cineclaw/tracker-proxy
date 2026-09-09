@@ -43,8 +43,10 @@ type Item struct {
 	Leeches       int      `json:"leeches"`                // Total aggregated swarm leeches
 	Tracker       string   `json:"tracker"`                // "rutor", "rutracker", "nnmclub"
 	Quality       string   `json:"quality,omitempty"`      // Best available quality (e.g. "4K UHD | 1080p")
+	Resolution    string   `json:"resolution,omitempty"`   // "4k", "1080p", "lq"
 	TorrentCount  int      `json:"torrent_count"`          // Number of distinct releases merged
 }
+
 
 // Response represents a paginated shelf response matching frontend FeedShelf
 type Response struct {

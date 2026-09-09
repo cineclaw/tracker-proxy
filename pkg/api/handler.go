@@ -125,7 +125,7 @@ func filterAndRankBySeason(results []models.TorrentResult, season int) []models.
 	return append(tier1, tier2...)
 }
 
-func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID string, season int, refreshCache bool, limit int) ([]models.TorrentResult, string) {
+func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType string, season int, refreshCache bool, limit int) ([]models.TorrentResult, string) {
 	normIMDb := cache.NormalizeIMDbID(imdbID)
 	cacheStatus := "BYPASS"
 
@@ -176,6 +176,7 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID string, se
 		v, err, _ := h.sf.Do(normIMDb, func() (any, error) {
 			res := h.aggregator.Search(ctx, models.SearchQuery{
 				Query:        queryStr,
+				Type:         mediaType,
 				IMDbID:       normIMDb,
 				RefreshCache: refreshCache,
 				Limit:        limit,
@@ -197,6 +198,7 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID string, se
 
 	results := h.aggregator.Search(ctx, models.SearchQuery{
 		Query: queryStr,
+		Type:  mediaType,
 		Limit: limit,
 	})
 	filtered := filterAndRankBySeason(results, season)
@@ -205,6 +207,7 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID string, se
 	}
 	return filtered, cacheStatus
 }
+
 
 func (h *Handler) handleJSONSearch(w http.ResponseWriter, r *http.Request) {
 	queryStr := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -237,11 +240,16 @@ func (h *Handler) handleJSONSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	mediaType := strings.TrimSpace(r.URL.Query().Get("type"))
+	if mediaType == "" {
+		mediaType = strings.TrimSpace(r.URL.Query().Get("media_type"))
+	}
+
 	start := time.Now()
-	results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, season, refreshCache, limit)
+	results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, mediaType, season, refreshCache, limit)
 	duration := time.Since(start)
 
-	log.Printf("[search] query=%q imdb_id=%q season=%d cache=%s returned=%d duration=%v", queryStr, imdbID, season, cacheStatus, len(results), duration)
+	log.Printf("[search] query=%q imdb_id=%q type=%q season=%d cache=%s returned=%d duration=%v", queryStr, imdbID, mediaType, season, cacheStatus, len(results), duration)
 
 	w.Header().Set("X-Cache", cacheStatus)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -262,6 +270,13 @@ func (h *Handler) handleTorznab(w http.ResponseWriter, r *http.Request) {
 		imdbID := strings.TrimSpace(r.URL.Query().Get("imdbid"))
 		if imdbID == "" {
 			imdbID = strings.TrimSpace(r.URL.Query().Get("imdb_id"))
+		}
+
+		torznabType := ""
+		if strings.ToLower(t) == "movie" {
+			torznabType = "movie"
+		} else if strings.ToLower(t) == "tvsearch" {
+			torznabType = "tv"
 		}
 
 		refreshStr := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("refresh_cache")))
@@ -285,7 +300,8 @@ func (h *Handler) handleTorznab(w http.ResponseWriter, r *http.Request) {
 		}
 
 		start := time.Now()
-		results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, season, refreshCache, limit)
+		results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, torznabType, season, refreshCache, limit)
+
 		duration := time.Since(start)
 
 		log.Printf("[torznab] t=%s query=%q imdb_id=%q season=%d cache=%s returned=%d duration=%v", t, queryStr, imdbID, season, cacheStatus, len(results), duration)
@@ -332,6 +348,7 @@ func (h *Handler) handleStreamMount(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.mounter.MountTorrent(r.Context(), req)
 	if err != nil {
+		log.Printf("[mounter] MountTorrent FAILED: %v", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -504,16 +521,25 @@ func (h *Handler) handleHotlist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mediaType := r.URL.Query().Get("type")
+	mediaType := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("type")))
+	if mediaType == "" {
+		mediaType = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("media_type")))
+	}
+	quality := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("quality")))
+	if quality == "" {
+		quality = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("resolution")))
+	}
+
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh_cache") == "true"
 
-	resp, err := h.hotlist.GetHotlist(r.Context(), mediaType, page, limit, refresh)
+	resp, err := h.hotlist.GetHotlist(r.Context(), mediaType, quality, page, limit, refresh)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

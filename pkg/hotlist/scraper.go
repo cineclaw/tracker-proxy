@@ -68,6 +68,41 @@ func (s *Scraper) ScrapeSeries(ctx context.Context, limit int) ([]RawTorrent, er
 	return s.scrapeUrlsConcurrently(ctx, urls, "tv", limit)
 }
 
+// ScrapeAnime fetches top-seeded anime releases from RuTor category 10
+func (s *Scraper) ScrapeAnime(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	for page := 0; page < 10; page++ {
+		urls = append(urls, fmt.Sprintf("%s/browse/%d/10/0/2", s.baseURL, page))
+	}
+	return s.scrapeUrlsConcurrently(ctx, urls, "tv", limit)
+}
+
+// ScrapeDocumentaries fetches top-seeded documentary releases from RuTor category 12
+func (s *Scraper) ScrapeDocumentaries(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	for page := 0; page < 10; page++ {
+		urls = append(urls, fmt.Sprintf("%s/browse/%d/12/0/2", s.baseURL, page))
+	}
+	return s.scrapeUrlsConcurrently(ctx, urls, "movie", limit)
+}
+
+// ScrapeUHD fetches high-resolution 4K/2160p releases specifically
+func (s *Scraper) ScrapeUHD(ctx context.Context, mediaType string, limit int) ([]RawTorrent, error) {
+	var urls []string
+	cat := 1
+	mType := "movie"
+	if mediaType == "tv" {
+		cat = 4
+		mType = "tv"
+	}
+	for page := 0; page < 5; page++ {
+		urls = append(urls, fmt.Sprintf("%s/search/%d/%d/0/2/2160p", s.baseURL, page, cat))
+		urls = append(urls, fmt.Sprintf("%s/search/%d/%d/0/2/UHD", s.baseURL, page, cat))
+	}
+	return s.scrapeUrlsConcurrently(ctx, urls, mType, limit)
+}
+
+
 func (s *Scraper) scrapeUrlsConcurrently(ctx context.Context, urls []string, mediaType string, limit int) ([]RawTorrent, error) {
 	type pageResult struct {
 		torrents []RawTorrent

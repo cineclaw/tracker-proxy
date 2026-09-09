@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
 	"go.etcd.io/bbolt"
 )
+
 
 var (
 	hotlistBucketName = []byte("tracker_hotlist")
@@ -55,6 +57,8 @@ func NewService(scraper *Scraper, matcher *Matcher, db *bbolt.DB, ttl time.Durat
 	// Load initial data from bbolt if available
 	s.loadFromDB("movie")
 	s.loadFromDB("tv")
+	s.loadFromDB("anime")
+	s.loadFromDB("doc")
 
 	// Start periodic background refresher every 2 hours
 	go s.backgroundRefresher()
@@ -62,10 +66,26 @@ func NewService(scraper *Scraper, matcher *Matcher, db *bbolt.DB, ttl time.Durat
 	return s
 }
 
-func (s *Service) GetHotlist(ctx context.Context, mediaType string, page, limit int, forceRefresh bool) (*Response, error) {
-	if mediaType != "tv" {
-		mediaType = "movie"
+func (s *Service) GetHotlist(ctx context.Context, mediaType, quality string, page, limit int, forceRefresh bool) (*Response, error) {
+	shelfID := "tracker_hotlist"
+	shelfTitle := "Популярно на трекерах"
+	validType := "movie"
+
+	switch strings.ToLower(mediaType) {
+	case "tv":
+		validType = "tv"
+	case "anime":
+		validType = "anime"
+		shelfID = "anime_hub"
+		shelfTitle = "Аниме & Мультипликация"
+	case "doc":
+		validType = "doc"
+		shelfID = "doc_hub"
+		shelfTitle = "Документальное кино"
+	default:
+		validType = "movie"
 	}
+
 	if page < 1 {
 		page = 1
 	}
@@ -73,7 +93,21 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType string, page, limit 
 		limit = 20
 	}
 
-	items := s.getItems(ctx, mediaType, forceRefresh)
+	items := s.getItems(ctx, validType, forceRefresh)
+
+	is4K := strings.EqualFold(quality, "4k") || strings.EqualFold(quality, "uhd")
+	if is4K {
+		shelfID = "uhd_4k"
+		shelfTitle = "4K UHD Кинозал"
+		var uhdItems []Item
+		for _, it := range items {
+			q := strings.ToUpper(it.Quality)
+			if it.Resolution == "4k" || strings.Contains(q, "4K") || strings.Contains(q, "UHD") || strings.Contains(q, "2160P") {
+				uhdItems = append(uhdItems, it)
+			}
+		}
+		items = uhdItems
+	}
 
 	totalResults := len(items)
 	totalPages := int(math.Ceil(float64(totalResults) / float64(limit)))
@@ -87,9 +121,9 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType string, page, limit 
 
 	if start >= totalResults {
 		return &Response{
-			ID:           "tracker_hotlist",
-			Title:        "Популярно на трекерах",
-			MediaType:    mediaType,
+			ID:           shelfID,
+			Title:        shelfTitle,
+			MediaType:    validType,
 			Page:         page,
 			TotalPages:   totalPages,
 			TotalResults: totalResults,
@@ -102,9 +136,9 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType string, page, limit 
 	}
 
 	return &Response{
-		ID:           "tracker_hotlist",
-		Title:        "Популярно на трекерах",
-		MediaType:    mediaType,
+		ID:           shelfID,
+		Title:        shelfTitle,
+		MediaType:    validType,
 		Page:         page,
 		TotalPages:   totalPages,
 		TotalResults: totalResults,
@@ -159,7 +193,7 @@ func (s *Service) triggerRefresh(mediaType string) {
 		s.fetchMu.Unlock()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	s.fetchAndSave(ctx, mediaType)
@@ -169,11 +203,20 @@ func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
 	log.Printf("[hotlist] Fetching 10 pages per category from RuTor for %s...", mediaType)
 	var raw []RawTorrent
 	var err error
+	matchingMediaType := mediaType
 
-	if mediaType == "tv" {
+	switch mediaType {
+	case "tv":
 		raw, err = s.scraper.ScrapeSeries(ctx, 0)
-	} else {
+	case "anime":
+		raw, err = s.scraper.ScrapeAnime(ctx, 0)
+		matchingMediaType = "tv"
+	case "doc":
+		raw, err = s.scraper.ScrapeDocumentaries(ctx, 0)
+		matchingMediaType = "movie"
+	default:
 		raw, err = s.scraper.ScrapeMovies(ctx, 0)
+		matchingMediaType = "movie"
 	}
 
 	if err != nil {
@@ -182,7 +225,7 @@ func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
 	}
 
 	log.Printf("[hotlist] Scraped %d raw releases for %s. Matching against Tantivy...", len(raw), mediaType)
-	items := s.matcher.MatchAndGroup(ctx, raw, mediaType)
+	items := s.matcher.MatchAndGroup(ctx, raw, matchingMediaType)
 	log.Printf("[hotlist] Grouped into %d unique items for %s", len(items), mediaType)
 
 	data := CachedData{
@@ -228,18 +271,16 @@ func (s *Service) loadFromDB(mediaType string) {
 		if b == nil {
 			return nil
 		}
-		bytes := b.Get([]byte(mediaType))
-		if bytes == nil {
+		val := b.Get([]byte(mediaType))
+		if len(val) == 0 {
 			return nil
 		}
-
 		var data CachedData
-		if err := json.Unmarshal(bytes, &data); err == nil && len(data.Items) > 0 {
+		if err := json.Unmarshal(val, &data); err == nil {
 			s.mu.Lock()
 			s.memCache[mediaType] = data
 			s.mu.Unlock()
-			log.Printf("[hotlist] Loaded %d cached %s items from bbolt (updated %v ago)",
-				len(data.Items), mediaType, time.Since(data.UpdatedAt).Round(time.Minute))
+			log.Printf("[hotlist] Restored %d cached %s hotlist items from bbolt", len(data.Items), mediaType)
 		}
 		return nil
 	})
@@ -250,7 +291,12 @@ func (s *Service) backgroundRefresher() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.triggerRefresh("movie")
-		s.triggerRefresh("tv")
+		log.Printf("[hotlist] Periodic background refresh triggered for movie, tv, anime, doc...")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		s.fetchAndSave(ctx, "movie")
+		s.fetchAndSave(ctx, "tv")
+		s.fetchAndSave(ctx, "anime")
+		s.fetchAndSave(ctx, "doc")
+		cancel()
 	}
 }

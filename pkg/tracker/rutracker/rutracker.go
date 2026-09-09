@@ -223,8 +223,50 @@ func (t *Tracker) Login(ctx context.Context) error {
 	return nil
 }
 
-func (t *Tracker) doSearch(ctx context.Context, queryEncoded string) (*http.Response, error) {
-	searchURL := fmt.Sprintf("%s/forum/tracker.php?nm=%s", t.baseURL, queryEncoded)
+var (
+	rutrackerMovieForums = []int{
+		1457, 1940, 271, 313, 312, 2339, 252, 1950, 2200, 941,
+		1666, 124, 352, 4, 1105, 1936, 314, 46,
+	}
+
+	rutrackerSeriesForums = []int{
+		119, 1171, 2366, 1803, 842, 812, 81, 920, 921, 1106, 315,
+	}
+)
+
+func buildRuTrackerForumFilter(mediaType string) string {
+	var targetForums []int
+	lower := strings.ToLower(strings.TrimSpace(mediaType))
+	switch lower {
+	case "movie":
+		targetForums = rutrackerMovieForums
+	case "tv", "tvseries", "series":
+		targetForums = rutrackerSeriesForums
+	default:
+		seen := make(map[int]bool)
+		for _, f := range rutrackerMovieForums {
+			if !seen[f] {
+				seen[f] = true
+				targetForums = append(targetForums, f)
+			}
+		}
+		for _, f := range rutrackerSeriesForums {
+			if !seen[f] {
+				seen[f] = true
+				targetForums = append(targetForums, f)
+			}
+		}
+	}
+
+	var sb strings.Builder
+	for _, f := range targetForums {
+		sb.WriteString(fmt.Sprintf("&f[]=%d", f))
+	}
+	return sb.String()
+}
+
+func (t *Tracker) doSearch(ctx context.Context, queryEncoded, forumFilter string) (*http.Response, error) {
+	searchURL := fmt.Sprintf("%s/forum/tracker.php?nm=%s%s", t.baseURL, queryEncoded, forumFilter)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
 	if err != nil {
 		return nil, err
@@ -257,7 +299,9 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to encode query to CP1251: %w", err)
 	}
 
-	resp, err := t.doSearch(ctx, queryEncoded)
+	forumFilter := buildRuTrackerForumFilter(query.Type)
+	resp, err := t.doSearch(ctx, queryEncoded, forumFilter)
+
 	if err != nil {
 		return nil, fmt.Errorf("rutracker search request failed: %w", err)
 	}
@@ -280,10 +324,11 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		}
 
 		// Retry search request with fresh clearance and User-Agent
-		resp, err = t.doSearch(ctx, queryEncoded)
+		resp, err = t.doSearch(ctx, queryEncoded, forumFilter)
 		if err != nil {
 			return nil, fmt.Errorf("rutracker retry search failed: %w", err)
 		}
+
 	}
 	defer resp.Body.Close()
 
