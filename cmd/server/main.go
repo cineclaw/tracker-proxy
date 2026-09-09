@@ -10,12 +10,14 @@ import (
 	"syscall"
 	"time"
 
+	"go.etcd.io/bbolt"
 	"tracker-proxy/config"
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/api"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/flaresolverr"
+	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/tracker"
 	"tracker-proxy/pkg/tracker/nnmclub"
 	"tracker-proxy/pkg/tracker/rutor"
@@ -111,9 +113,23 @@ func main() {
 		log.Println("Authentication disabled")
 	}
 
+	// Hotlist / Trending Service
+	indexerURL := os.Getenv("IMDB_INDEXER_URL")
+	if indexerURL == "" {
+		indexerURL = "http://imdb-indexer:8090"
+	}
+	scraper := hotlist.NewScraper(cfg.Trackers.Rutor.BaseURL)
+	matcher := hotlist.NewMatcher(indexerURL)
+	var boltDB *bbolt.DB
+	if cacheStore != nil {
+		boltDB = cacheStore.DB()
+	}
+	hotlistSvc := hotlist.NewService(scraper, matcher, boltDB, 2*time.Hour)
+	log.Printf("Tracker hotlist service initialized (indexer: %s)", indexerURL)
+
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore, authMgr)
+	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)

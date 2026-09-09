@@ -13,6 +13,7 @@ import (
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
+	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/models"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
@@ -24,10 +25,11 @@ type Handler struct {
 	cache      *cache.Store
 	mounter    *stream.Mounter
 	auth       *auth.Manager
+	hotlist    *hotlist.Service
 	sf         singleflight.Group
 }
 
-func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *auth.Manager) *Handler {
+func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *auth.Manager, hotlistSvc *hotlist.Service) *Handler {
 	m := stream.NewMounter(agg)
 	m.StartReconciler(context.Background(), 5*time.Minute)
 	return &Handler{
@@ -35,6 +37,7 @@ func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *au
 		cache:      cacheStore,
 		mounter:    m,
 		auth:       authMgr,
+		hotlist:    hotlistSvc,
 	}
 }
 
@@ -43,6 +46,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/search", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/api/torrents", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/torrents", h.corsMiddleware(h.handleJSONSearch))
+
+	// Tracker hotlist / trending
+	mux.HandleFunc("/api/stream/hotlist", h.corsMiddleware(h.handleHotlist))
+	mux.HandleFunc("/stream/hotlist", h.corsMiddleware(h.handleHotlist))
+	mux.HandleFunc("/torrents/hotlist", h.corsMiddleware(h.handleHotlist))
 
 	// Mount / Unmount / Status
 	mux.HandleFunc("/api/stream/mount", h.corsMiddleware(h.handleStreamMount))
@@ -485,5 +493,31 @@ func (h *Handler) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 		"username":      h.auth.GetUsername(),
 	})
 }
+
+func (h *Handler) handleHotlist(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.hotlist == nil {
+		http.Error(w, "Hotlist service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	mediaType := r.URL.Query().Get("type")
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh_cache") == "true"
+
+	resp, err := h.hotlist.GetHotlist(r.Context(), mediaType, page, limit, refresh)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 
 

@@ -92,6 +92,14 @@ func New(path string, ttl time.Duration) (*Store, error) {
 	return store, nil
 }
 
+// DB returns the underlying bbolt database instance.
+func (s *Store) DB() *bbolt.DB {
+	if s == nil {
+		return nil
+	}
+	return s.db
+}
+
 // Get retrieves cached torrent results for the given IMDb ID.
 // Returns (results, found, error). If expired or not found, found is false.
 func (s *Store) Get(rawID string) ([]models.TorrentResult, bool, error) {
