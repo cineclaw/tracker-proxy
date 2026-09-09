@@ -4,14 +4,21 @@ FROM golang:alpine AS builder
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
 
+ARG TARGETARCH
+
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 ARG VERSION=1.0.0
 ARG COMMIT=""
 ARG BUILD_TIME=""
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'tracker-proxy/pkg/version.Version=${VERSION}' -X 'tracker-proxy/pkg/version.Commit=${COMMIT}' -X 'tracker-proxy/pkg/version.BuildTime=${BUILD_TIME}'" -o /app/tracker-proxy ./cmd/server
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=gobuild-${TARGETARCH},target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X 'tracker-proxy/pkg/version.Version=${VERSION}' -X 'tracker-proxy/pkg/version.Commit=${COMMIT}' -X 'tracker-proxy/pkg/version.BuildTime=${BUILD_TIME}'" \
+    -o /app/tracker-proxy ./cmd/server
 
 # Final minimal stage
 FROM alpine:latest
