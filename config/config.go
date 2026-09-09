@@ -12,6 +12,14 @@ type Config struct {
 	FlareSolverr FlareSolverrConfig `yaml:"flaresolverr"`
 	Cache        CacheConfig        `yaml:"cache"`
 	Trackers     TrackersConfig     `yaml:"trackers"`
+	Auth         AuthConfig         `yaml:"auth"`
+}
+
+type AuthConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	Secret   string `yaml:"secret"`
 }
 
 type FlareSolverrConfig struct {
@@ -89,6 +97,12 @@ func DefaultConfig() *Config {
 				BaseURL: "https://rutracker.org",
 			},
 		},
+		Auth: AuthConfig{
+			Enabled:  true,
+			Username: "admin",
+			Password: "wavemp3",
+			Secret:   "",
+		},
 	}
 }
 
@@ -148,6 +162,20 @@ func Load(path string) (*Config, error) {
 	}
 	if ua := os.Getenv("RUTRACKER_USER_AGENT"); ua != "" {
 		cfg.Trackers.RuTracker.UserAgent = ua
+	}
+
+	// Auth environment overrides
+	if aEnabled := os.Getenv("AUTH_ENABLED"); aEnabled != "" {
+		cfg.Auth.Enabled = aEnabled == "true" || aEnabled == "1"
+	}
+	if aUser := os.Getenv("AUTH_USERNAME"); aUser != "" {
+		cfg.Auth.Username = aUser
+	}
+	if aPass := os.Getenv("AUTH_PASSWORD"); aPass != "" {
+		cfg.Auth.Password = aPass
+	}
+	if aSecret := os.Getenv("AUTH_SECRET"); aSecret != "" {
+		cfg.Auth.Secret = aSecret
 	}
 
 	return cfg, nil

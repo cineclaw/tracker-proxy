@@ -13,6 +13,7 @@ import (
 	"tracker-proxy/config"
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/api"
+	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/flaresolverr"
 	"tracker-proxy/pkg/tracker"
@@ -102,9 +103,17 @@ func main() {
 	timeout := time.Duration(cfg.Server.TimeoutSeconds) * time.Second
 	agg := aggregator.New(trackers, cacheStore, timeout)
 
+	// Auth Manager
+	authMgr := auth.NewManager(cfg.Auth.Enabled, cfg.Auth.Username, cfg.Auth.Password, cfg.Auth.Secret)
+	if cfg.Auth.Enabled {
+		log.Printf("Authentication enabled (username: %s)", cfg.Auth.Username)
+	} else {
+		log.Println("Authentication disabled")
+	}
+
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore)
+	handler := api.NewHandler(agg, cacheStore, authMgr)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)

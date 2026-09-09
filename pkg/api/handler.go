@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 	"tracker-proxy/pkg/aggregator"
+	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/models"
 	"tracker-proxy/pkg/stream"
@@ -22,16 +23,18 @@ type Handler struct {
 	aggregator *aggregator.Aggregator
 	cache      *cache.Store
 	mounter    *stream.Mounter
+	auth       *auth.Manager
 	sf         singleflight.Group
 }
 
-func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store) *Handler {
+func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *auth.Manager) *Handler {
 	m := stream.NewMounter(agg)
 	m.StartReconciler(context.Background(), 5*time.Minute)
 	return &Handler{
 		aggregator: agg,
 		cache:      cacheStore,
 		mounter:    m,
+		auth:       authMgr,
 	}
 }
 
@@ -57,6 +60,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Jellyfin webhook endpoints
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
 	mux.HandleFunc("/webhook/deleted", h.handleJellyfinItemDeleted)
+
+	// Auth endpoints
+	mux.HandleFunc("/api/auth/login", h.corsMiddleware(h.handleAuthLogin))
+	mux.HandleFunc("/api/auth/verify", h.handleAuthVerify)
+	mux.HandleFunc("/api/auth/logout", h.corsMiddleware(h.handleAuthLogout))
+	mux.HandleFunc("/api/auth/me", h.corsMiddleware(h.handleAuthMe))
 
 	// Torznab endpoints: supports both Jackett-style and direct paths
 	mux.HandleFunc("/api", h.handleTorznab)
@@ -398,4 +407,83 @@ func (h *Handler) handleJellyfinItemDeleted(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
+
+type loginRequest struct {
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	RememberMe bool   `json:"remember_me"`
+}
+
+type loginResponse struct {
+	Success   bool   `json:"success"`
+	Token     string `json:"token"`
+	Username  string `json:"username"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func (h *Handler) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request format"})
+		return
+	}
+
+	token, expiresAt, err := h.auth.Login(req.Username, req.Password, req.RememberMe)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid username or password"})
+		return
+	}
+
+	http.SetCookie(w, h.auth.BuildCookie(token, expiresAt))
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(loginResponse{
+		Success:   true,
+		Token:     token,
+		Username:  req.Username,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
+	})
+}
+
+func (h *Handler) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
+	if !h.auth.ValidateRequest(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"authorized"}`))
+}
+
+func (h *Handler) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, h.auth.BuildLogoutCookie())
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"success":true,"message":"logged out"}`))
+}
+
+func (h *Handler) handleAuthMe(w http.ResponseWriter, r *http.Request) {
+	if !h.auth.ValidateRequest(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"authenticated":false}`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"authenticated": true,
+		"username":      h.auth.GetUsername(),
+	})
+}
+
 
