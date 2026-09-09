@@ -1210,24 +1210,22 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 		return
 	}
 
-	// 2. Immediately trigger refresh of the parent library (instant folder discovery)
-	refreshURL := fmt.Sprintf("%s/Items/%s/Refresh?Recursive=true&ImageRefreshMode=FullRefresh&MetadataRefreshMode=FullRefresh&ReplaceAllImages=false&ReplaceAllMetadata=false", m.jellyfinURL, libraryFolderID)
-	refreshReq, err := http.NewRequest("POST", refreshURL, nil)
+	// 2. Immediately trigger refresh of the parent library (instant folder discovery without recursive deep-probe)
+	refreshReq, err := http.NewRequest("POST", fmt.Sprintf("%s/Items/%s/Refresh", m.jellyfinURL, libraryFolderID), nil)
 	if err == nil {
 		refreshReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
 		if resp, err := m.client.Do(refreshReq); err == nil {
 			resp.Body.Close()
-			log.Printf("[mounter] Triggered immediate recursive refresh for library %s (%s)", targetFolderType, libraryFolderID)
+			log.Printf("[mounter] Triggered targeted refresh for library %s (%s)", targetFolderType, libraryFolderID)
 		}
 	}
-	m.notifyJellyfinLibraryScan(isSeries)
 
 	if folderName == "" && tconst == "" {
 		return
 	}
 
-	// 3. Wait briefly for folder discovery, locate the item ID, and trigger refresh
-	// This ensures all NFO metadata is immediately bound with titles and overviews.
+	// 3. Wait briefly for folder discovery, locate the item ID, and trigger targeted refresh
+	// This ensures all NFO metadata is immediately bound with titles and overviews ONLY for this item.
 	go func() {
 		imdbPattern := ""
 		if tconst != "" {
@@ -1239,13 +1237,8 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 			itemLabel = "Series"
 		}
 
-		for attempt := 1; attempt <= 15; attempt++ {
-			time.Sleep(800 * time.Millisecond)
-
-			// Re-poke library scan periodically if discovery takes a moment
-			if attempt == 5 || attempt == 10 {
-				m.notifyJellyfinLibraryScan(isSeries)
-			}
+		for attempt := 1; attempt <= 10; attempt++ {
+			time.Sleep(500 * time.Millisecond)
 
 			itemsURL := fmt.Sprintf("%s/Items?parentId=%s&fields=Path", m.jellyfinURL, libraryFolderID)
 			itemReq, err := http.NewRequest("GET", itemsURL, nil)
@@ -1292,7 +1285,7 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 				return
 			}
 		}
-		log.Printf("[mounter] %s item for %s not discovered in Jellyfin after 12s polling", itemLabel, folderName)
+		log.Printf("[mounter] %s item for %s not discovered in Jellyfin after 5s polling", itemLabel, folderName)
 	}()
 }
 
