@@ -194,6 +194,9 @@ type MovieMeta struct {
 }
 
 func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountResponse, error) {
+	log.Printf("[mounter] MountTorrent requested: title=%q tconst=%q type=%q season=%d mode=%q version=%q folder=%q",
+		req.Title, req.Tconst, req.Type, req.Season, req.Mode, req.VersionName, req.FolderName)
+
 	// 0. Resolve missing magnet link if torrent_id and tracker are provided
 	if req.Magnet == "" && req.TorrentID != "" {
 		if m.hashResolver != nil && req.Tracker != "" {
@@ -225,17 +228,31 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 		return nil, fmt.Errorf("failed to fetch torrent metadata: %w", err)
 	}
 
-	// 3. Filter video files
-	var videoFiles []FileStat
+	// 3. Filter video files (and exclude samples/featurettes/trailers)
+	var allVideos []FileStat
+	var maxVideoLen int64
 	for _, f := range details.FileStats {
 		ext := strings.ToLower(filepath.Ext(f.Path))
 		if ext == ".mkv" || ext == ".mp4" || ext == ".avi" || ext == ".mov" || ext == ".m4v" || ext == ".ts" {
-			videoFiles = append(videoFiles, f)
+			allVideos = append(allVideos, f)
+			if f.Length > maxVideoLen {
+				maxVideoLen = f.Length
+			}
 		}
 	}
 
-	if len(videoFiles) == 0 {
+	if len(allVideos) == 0 {
 		return nil, fmt.Errorf("no video files found in torrent")
+	}
+
+	var videoFiles []FileStat
+	for _, f := range allVideos {
+		if !isSampleFile(f.Path, f.Length, maxVideoLen) {
+			videoFiles = append(videoFiles, f)
+		}
+	}
+	if len(videoFiles) == 0 {
+		videoFiles = allVideos
 	}
 
 	cleanTitle := sanitizeFilename(req.Title)
@@ -249,15 +266,28 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 	}
 
 	var createdRelativePaths []string
-	isSeries := strings.EqualFold(req.Type, "tvSeries") || strings.EqualFold(req.Type, "series") || strings.EqualFold(req.Type, "tvMiniSeries") || req.Season > 0 || len(videoFiles) > 1
+	isMovie := strings.EqualFold(req.Type, "movie")
+	isExplicitSeries := strings.EqualFold(req.Type, "tvSeries") || strings.EqualFold(req.Type, "series") || strings.EqualFold(req.Type, "tvMiniSeries") || req.Season > 0
+
+	isSeries := false
+	if isMovie {
+		isSeries = false
+	} else if isExplicitSeries {
+		isSeries = true
+	} else if req.Type == "" {
+		// Heuristic fallback only when type was not provided by client
+		if len(videoFiles) > 1 {
+			isSeries = true
+		}
+	}
 
 	targetType := "movies"
 	if isSeries {
 		targetType = "shows"
 	}
 
-	// Safeguard: if already mounted under shows, ensure isSeries is true
-	if !isSeries && req.Tconst != "" {
+	// Safeguard: if already mounted under shows, ensure isSeries is true ONLY if client did not explicitly specify movie
+	if !isSeries && !isMovie && req.Tconst != "" {
 		if folder, _ := m.findExistingFolder("shows", req.Tconst); folder != "" {
 			isSeries = true
 			targetType = "shows"
@@ -1118,6 +1148,30 @@ func (m *Mounter) downloadPoster(ctx context.Context, tconst, destPath string) {
 	}
 }
 
+func isSampleFile(path string, length int64, maxLen int64) bool {
+	lower := strings.ToLower(filepath.ToSlash(path))
+	base := strings.ToLower(filepath.Base(path))
+
+	// If file is small (< 250 MB) and main video is significantly larger (> 500 MB)
+	if length < 250*1024*1024 && maxLen > 500*1024*1024 {
+		if strings.Contains(lower, "/sample") || strings.Contains(lower, "\\sample") ||
+			strings.Contains(base, "sample") || strings.Contains(base, "trailer") ||
+			strings.Contains(base, "featurette") || strings.Contains(base, "bonus") {
+			return true
+		}
+	}
+
+	// Strict directory check
+	if strings.Contains(lower, "/sample/") || strings.Contains(lower, "/samples/") ||
+		strings.HasPrefix(lower, "sample/") || strings.HasPrefix(lower, "samples/") {
+		if length < 300*1024*1024 && maxLen > 500*1024*1024 {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 	if m.jellyfinAPIKey == "" {
 		log.Printf("Notice: JELLYFIN_API_KEY is not set, skipping Jellyfin notification")
@@ -1157,14 +1211,16 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 	}
 
 	// 2. Immediately trigger refresh of the parent library (instant folder discovery)
-	refreshReq, err := http.NewRequest("POST", fmt.Sprintf("%s/Items/%s/Refresh", m.jellyfinURL, libraryFolderID), nil)
+	refreshURL := fmt.Sprintf("%s/Items/%s/Refresh?Recursive=true&ImageRefreshMode=FullRefresh&MetadataRefreshMode=FullRefresh&ReplaceAllImages=false&ReplaceAllMetadata=false", m.jellyfinURL, libraryFolderID)
+	refreshReq, err := http.NewRequest("POST", refreshURL, nil)
 	if err == nil {
 		refreshReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
 		if resp, err := m.client.Do(refreshReq); err == nil {
 			resp.Body.Close()
-			log.Printf("[mounter] Triggered immediate refresh for library %s (%s)", targetFolderType, libraryFolderID)
+			log.Printf("[mounter] Triggered immediate recursive refresh for library %s (%s)", targetFolderType, libraryFolderID)
 		}
 	}
+	m.notifyJellyfinLibraryScan(isSeries)
 
 	if folderName == "" && tconst == "" {
 		return
@@ -1178,8 +1234,18 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 			imdbPattern = fmt.Sprintf("[imdbid-%s]", tconst)
 		}
 
-		for attempt := 1; attempt <= 10; attempt++ {
-			time.Sleep(500 * time.Millisecond)
+		itemLabel := "Movie"
+		if isSeries {
+			itemLabel = "Series"
+		}
+
+		for attempt := 1; attempt <= 15; attempt++ {
+			time.Sleep(800 * time.Millisecond)
+
+			// Re-poke library scan periodically if discovery takes a moment
+			if attempt == 5 || attempt == 10 {
+				m.notifyJellyfinLibraryScan(isSeries)
+			}
 
 			itemsURL := fmt.Sprintf("%s/Items?parentId=%s&fields=Path", m.jellyfinURL, libraryFolderID)
 			itemReq, err := http.NewRequest("GET", itemsURL, nil)
@@ -1205,28 +1271,28 @@ func (m *Mounter) notifyJellyfin(isSeries bool, folderName, tconst string) {
 				continue
 			}
 
-			var matchedSeriesID string
+			var matchedItemID string
 			for _, item := range itemsResp.Items {
 				if (folderName != "" && strings.Contains(item.Path, folderName)) || (imdbPattern != "" && strings.Contains(item.Path, imdbPattern)) {
-					matchedSeriesID = item.ID
+					matchedItemID = item.ID
 					break
 				}
 			}
 
-			if matchedSeriesID != "" {
-				seriesRefreshURL := fmt.Sprintf("%s/Items/%s/Refresh?MetadataRefreshMode=FullRefresh&ReplaceAllMetadata=true&ImageRefreshMode=FullRefresh&ReplaceAllImages=true&Recursive=true", m.jellyfinURL, matchedSeriesID)
+			if matchedItemID != "" {
+				seriesRefreshURL := fmt.Sprintf("%s/Items/%s/Refresh?MetadataRefreshMode=FullRefresh&ReplaceAllMetadata=true&ImageRefreshMode=FullRefresh&ReplaceAllImages=true&Recursive=true", m.jellyfinURL, matchedItemID)
 				srReq, err := http.NewRequest("POST", seriesRefreshURL, nil)
 				if err == nil {
 					srReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
 					if sResp, err := m.client.Do(srReq); err == nil {
 						sResp.Body.Close()
-						log.Printf("[mounter] Triggered recursive episode refresh for series %s (%s)", folderName, matchedSeriesID)
+						log.Printf("[mounter] Triggered recursive refresh for %s item %s (%s)", itemLabel, folderName, matchedItemID)
 					}
 				}
 				return
 			}
 		}
-		log.Printf("[mounter] Series item for %s not found after 5s polling", folderName)
+		log.Printf("[mounter] %s item for %s not discovered in Jellyfin after 12s polling", itemLabel, folderName)
 	}()
 }
 
@@ -1275,11 +1341,9 @@ func (m *Mounter) findExistingFolder(targetType, tconst string) (folderName stri
 	}
 	targetPattern := fmt.Sprintf("[imdbid-%s]", tconst)
 
-	typesToCheck := []string{"shows", "movies"}
-	if targetType == "movies" {
+	typesToCheck := []string{targetType}
+	if targetType == "" {
 		typesToCheck = []string{"movies", "shows"}
-	} else if targetType == "shows" {
-		typesToCheck = []string{"shows", "movies"}
 	}
 
 	for _, t := range typesToCheck {
@@ -1552,7 +1616,20 @@ func parseSeasonEpisode(path string) (int, int) {
 		// Try trailing number without extension (e.g. "The Sopranos - 01.mkv")
 		noExt := strings.TrimSuffix(base, filepath.Ext(base))
 		if em := reTrailingEp.FindStringSubmatch(noExt); len(em) >= 2 {
-			e, _ = strconv.Atoi(em[1])
+			epNum, _ := strconv.Atoi(em[1])
+			// Exclude video codec and resolution numbers
+			isCodecOrRes := epNum == 264 || epNum == 265 || epNum == 720 || epNum == 1080 || epNum == 2160 || epNum == 480 || epNum == 576
+			precededByCodec := false
+			idx := strings.LastIndex(noExt, em[0])
+			if idx > 0 {
+				prefix := strings.ToLower(noExt[:idx])
+				if strings.HasSuffix(prefix, "h") || strings.HasSuffix(prefix, "x") || strings.HasSuffix(prefix, "h.") || strings.HasSuffix(prefix, "x.") {
+					precededByCodec = true
+				}
+			}
+			if !isCodecOrRes && !precededByCodec {
+				e = epNum
+			}
 		}
 	}
 
@@ -1923,14 +2000,14 @@ func (m *Mounter) HandleJellyfinItemDeleted(ctx context.Context, webhook Jellyfi
 	log.Printf("[webhook] ItemDeleted received: name=%q seriesName=%q itemType=%q path=%q imdbId=%q",
 		webhook.Name, webhook.SeriesName, webhook.ItemType, webhook.Path, webhook.ImdbId)
 
-	// 1. If ImdbId is present, try unmounting directly
-	if webhook.ImdbId != "" {
-		_, _ = m.UnmountTorrent(ctx, UnmountRequest{
-			Tconst: webhook.ImdbId,
-		})
+	reqType := ""
+	if strings.EqualFold(webhook.ItemType, "movie") {
+		reqType = "movie"
+	} else if strings.EqualFold(webhook.ItemType, "series") || strings.EqualFold(webhook.ItemType, "episode") || strings.EqualFold(webhook.ItemType, "season") {
+		reqType = "series"
 	}
 
-	// 2. If path is provided (e.g. /media/movies/... or /media/shows/...)
+	// 1. If path is provided (e.g. /media/movies/... or /media/shows/...)
 	if webhook.Path != "" {
 		rel := strings.TrimPrefix(webhook.Path, "/media/")
 		rel = strings.TrimPrefix(rel, "/")
@@ -1941,8 +2018,18 @@ func (m *Mounter) HandleJellyfinItemDeleted(ctx context.Context, webhook Jellyfi
 			_, _ = m.UnmountTorrent(ctx, UnmountRequest{
 				Type:       mediaType,
 				FolderName: folderName,
+				Tconst:     webhook.ImdbId,
 			})
+			return m.ReconcileOrphanedStubs(ctx)
 		}
+	}
+
+	// 2. If ImdbId is present without path, scope by reqType if known
+	if webhook.ImdbId != "" {
+		_, _ = m.UnmountTorrent(ctx, UnmountRequest{
+			Tconst: webhook.ImdbId,
+			Type:   reqType,
+		})
 	}
 
 	// 3. Trigger reconciliation to catch any leftover stubs
