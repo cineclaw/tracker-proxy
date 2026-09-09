@@ -1,0 +1,6 @@
+/bin
+/cache
+*.db
+*.log
+.DS_Store
+config.yaml

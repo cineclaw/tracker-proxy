@@ -1,0 +1,28 @@
+server:
+  port: 9118
+  timeout_seconds: 10
+
+flaresolverr:
+  enabled: true
+  url: "http://flaresolverr:8191/v1"
+  timeout_seconds: 60
+
+trackers:
+  rutor:
+    enabled: true
+    base_url: "https://rutor.info"
+
+  nnmclub:
+    enabled: true
+    base_url: "https://nnmclub.to"
+    username: ""
+    password: ""
+    cookie: ""
+
+  rutracker:
+    enabled: true
+    base_url: "https://rutracker.org"
+    username: ""
+    password: ""
+    cookie: ""
+    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
