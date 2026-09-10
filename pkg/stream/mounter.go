@@ -142,6 +142,10 @@ func NewMounter(resolver HashResolver) *Mounter {
 	}
 }
 
+func (m *Mounter) GetServiceURLs() (gostorm, jellyfin, indexer string) {
+	return m.gostormURL, m.jellyfinURL, m.indexerURL
+}
+
 type FileStat struct {
 	ID     int    `json:"id"`
 	Path   string `json:"path"`

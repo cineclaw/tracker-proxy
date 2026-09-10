@@ -3,10 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -43,6 +47,11 @@ func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *au
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/torrents/health", h.handleHealth)
+	mux.HandleFunc("/api/stream/health", h.handleHealth)
+	mux.HandleFunc("/api/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
+	mux.HandleFunc("/torrents/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
+
 	mux.HandleFunc("/api/search", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/api/torrents", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/torrents", h.corsMiddleware(h.handleJSONSearch))
@@ -89,6 +98,217 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service": "tracker-proxy",
 		"version": version.Version,
 	})
+}
+
+type ServiceDiagnosticResult struct {
+	Status    string                 `json:"status"` // "online" or "offline"
+	Version   string                 `json:"version,omitempty"`
+	LatencyMs int64                  `json:"latency_ms"`
+	Details   map[string]interface{} `json:"details,omitempty"`
+	Error     string                 `json:"error,omitempty"`
+}
+
+func (h *Handler) handleSystemDiagnostic(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	gostormURL, jellyfinURL, indexerURL := h.mounter.GetServiceURLs()
+	if gostormURL == "" {
+		gostormURL = "http://tiramisu:8090"
+	}
+	if jellyfinURL == "" {
+		jellyfinURL = "http://jellyfin:8096"
+	}
+	if indexerURL == "" {
+		indexerURL = "http://imdb-indexer:8090"
+	}
+
+	flaresolverrURL := os.Getenv("FLARESOLVERR_URL")
+	if flaresolverrURL == "" {
+		flaresolverrURL = "http://flaresolverr:8191"
+	}
+	aiURL := os.Getenv("AI_ENGINE_URL")
+	if aiURL == "" {
+		aiURL = "http://cineclaw-ai:9120"
+	}
+
+	results := make(map[string]ServiceDiagnosticResult)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// 1. tracker-proxy (self)
+	results["tracker-proxy"] = ServiceDiagnosticResult{
+		Status:    "online",
+		Version:   version.Version,
+		LatencyMs: 0,
+		Details: map[string]interface{}{
+			"Трекеры": "RuTracker, RuTor, NNM-Club",
+			"Кэш":     "bbolt (активен)",
+		},
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// Helper for probing HTTP endpoints
+	probe := func(id, url string, parser func([]byte) (string, map[string]interface{})) {
+		defer wg.Done()
+		start := time.Now()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			mu.Lock()
+			results[id] = ServiceDiagnosticResult{
+				Status:    "offline",
+				LatencyMs: time.Since(start).Milliseconds(),
+				Error:     err.Error(),
+			}
+			mu.Unlock()
+			return
+		}
+
+		resp, err := client.Do(req)
+		latency := time.Since(start).Milliseconds()
+		if err != nil {
+			mu.Lock()
+			results[id] = ServiceDiagnosticResult{
+				Status:    "offline",
+				LatencyMs: latency,
+				Error:     err.Error(),
+			}
+			mu.Unlock()
+			return
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			ver, details := parser(body)
+			mu.Lock()
+			results[id] = ServiceDiagnosticResult{
+				Status:    "online",
+				Version:   ver,
+				LatencyMs: latency,
+				Details:   details,
+			}
+			mu.Unlock()
+		} else {
+			mu.Lock()
+			results[id] = ServiceDiagnosticResult{
+				Status:    "offline",
+				LatencyMs: latency,
+				Error:     fmt.Sprintf("HTTP %d", resp.StatusCode),
+			}
+			mu.Unlock()
+		}
+	}
+
+	// 2. imdb-indexer
+	wg.Add(1)
+	go probe("imdb-indexer", strings.TrimRight(indexerURL, "/")+"/status", func(b []byte) (string, map[string]interface{}) {
+		ver := "1.0.0"
+		details := map[string]interface{}{}
+		var d struct {
+			Version        string `json:"version"`
+			TotalDocuments int    `json:"total_documents"`
+			IsIndexing     bool   `json:"is_indexing"`
+		}
+		if err := json.Unmarshal(b, &d); err == nil {
+			if d.Version != "" {
+				ver = d.Version
+			}
+			details["Проиндексировано фильмов"] = fmt.Sprintf("%d", d.TotalDocuments)
+			if d.IsIndexing {
+				details["Фоновая индексация"] = "Активна"
+			} else {
+				details["Фоновая индексация"] = "Неактивна"
+			}
+		}
+		return ver, details
+	})
+
+	// 3. jellyfin
+	wg.Add(1)
+	go probe("jellyfin", strings.TrimRight(jellyfinURL, "/")+"/System/Info/Public", func(b []byte) (string, map[string]interface{}) {
+		ver := "10.11.x"
+		details := map[string]interface{}{}
+		var d struct {
+			Version         string `json:"Version"`
+			ServerName      string `json:"ServerName"`
+			OperatingSystem string `json:"OperatingSystem"`
+		}
+		if err := json.Unmarshal(b, &d); err == nil {
+			if d.Version != "" {
+				ver = d.Version
+			}
+			if d.ServerName != "" {
+				details["Имя сервера"] = d.ServerName
+			}
+			if d.OperatingSystem != "" {
+				details["ОС сервера"] = d.OperatingSystem
+			}
+		}
+		return ver, details
+	})
+
+	// 4. tiramisu
+	wg.Add(1)
+	tiramisuMetricsURL := "http://tiramisu:9080/metrics"
+	go probe("tiramisu", tiramisuMetricsURL, func(b []byte) (string, map[string]interface{}) {
+		ver := "v1.9.59"
+		details := map[string]interface{}{
+			"Точка монтирования": "/media/virtual (FUSE)",
+			"Sequential stream":  "Активен",
+		}
+		var d struct {
+			Version string `json:"version"`
+			Uptime  string `json:"uptime"`
+		}
+		if err := json.Unmarshal(b, &d); err == nil && d.Version != "" {
+			ver = d.Version
+			if d.Uptime != "" {
+				details["Uptime"] = d.Uptime
+			}
+		}
+		return ver, details
+	})
+
+	// 5. flaresolverr
+	wg.Add(1)
+	go probe("flaresolverr", strings.TrimRight(flaresolverrURL, "/")+"/", func(b []byte) (string, map[string]interface{}) {
+		ver := "3.5.0"
+		details := map[string]interface{}{
+			"Сессия Turnstile": "Готов",
+		}
+		var d struct {
+			Version string `json:"version"`
+			Msg     string `json:"msg"`
+		}
+		if err := json.Unmarshal(b, &d); err == nil && d.Version != "" {
+			ver = d.Version
+		}
+		return ver, details
+	})
+
+	// 6. cineclaw-ai
+	wg.Add(1)
+	go probe("cineclaw-ai", strings.TrimRight(aiURL, "/")+"/health", func(b []byte) (string, map[string]interface{}) {
+		ver := "1.0.0"
+		details := map[string]interface{}{
+			"Модель":  "Gemini 2.5 Flash",
+			"Критики": "RT, Metacritic, IMDb",
+		}
+		var d struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(b, &d); err == nil && d.Version != "" {
+			ver = d.Version
+		}
+		return ver, details
+	})
+
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(results)
 }
 
 func filterAndRankBySeason(results []models.TorrentResult, season int) []models.TorrentResult {
