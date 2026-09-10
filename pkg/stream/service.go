@@ -2,8 +2,12 @@ package stream
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,6 +193,7 @@ type TorrStreamService struct {
 
 	mu              sync.RWMutex
 	mountedTorrents map[string]*MountedTorrentInfo
+	probeCache      map[string]*ProbeInfo
 }
 
 // Alias Mounter for backwards-compatibility with api.Handler
@@ -209,7 +214,98 @@ func NewTorrStreamService(torrURL, indexerURL string, store *playback.Store, nex
 		indexerURL:      indexerURL,
 		torrServerURL:   torrURL,
 		mountedTorrents: make(map[string]*MountedTorrentInfo),
+		probeCache:      make(map[string]*ProbeInfo),
 	}
+}
+
+type ffprobeStreamTag struct {
+	Language string `json:"language"`
+	Title    string `json:"title"`
+}
+
+type ffprobeStream struct {
+	Index     int              `json:"index"`
+	CodecName string           `json:"codec_name"`
+	CodecType string           `json:"codec_type"`
+	Channels  int              `json:"channels"`
+	Width     int              `json:"width"`
+	Height    int              `json:"height"`
+	Tags      ffprobeStreamTag `json:"tags"`
+}
+
+type ffprobeOutput struct {
+	Streams []ffprobeStream `json:"streams"`
+	Format  struct {
+		Duration string `json:"duration"`
+	} `json:"format"`
+}
+
+func (s *TorrStreamService) probeStream(ctx context.Context, hash string, fileId int) *ProbeInfo {
+	cacheKey := fmt.Sprintf("%s:%d", hash, fileId)
+	s.mu.RLock()
+	cached := s.probeCache[cacheKey]
+	s.mu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return nil
+	}
+
+	torrURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", s.torrServerURL, hash, fileId)
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(probeCtx, ffprobePath,
+		"-v", "error",
+		"-show_entries", "stream=index,codec_name,codec_type,channels,width,height:stream_tags=language,title:format=duration",
+		"-of", "json",
+		torrURL,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var data ffprobeOutput
+	if err := json.Unmarshal(out, &data); err != nil {
+		return nil
+	}
+
+	var durSec float64
+	if data.Format.Duration != "" {
+		durSec, _ = strconv.ParseFloat(data.Format.Duration, 64)
+	}
+
+	info := &ProbeInfo{
+		DurationNS: int64(durSec * 1e9),
+	}
+
+	for _, st := range data.Streams {
+		track := ProbeTrack{
+			Index:    st.Index,
+			Type:     st.CodecType,
+			Codec:    st.CodecName,
+			Channels: st.Channels,
+			Width:    st.Width,
+			Height:   st.Height,
+			Language: st.Tags.Language,
+			Title:    st.Tags.Title,
+		}
+		info.Tracks = append(info.Tracks, track)
+	}
+
+	s.mu.Lock()
+	if s.probeCache == nil {
+		s.probeCache = make(map[string]*ProbeInfo)
+	}
+	s.probeCache[cacheKey] = info
+	s.mu.Unlock()
+
+	return info
 }
 
 func (s *TorrStreamService) GetServiceURLs() (string, string, string) {
@@ -380,7 +476,7 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 	mountedInfo := s.mountedTorrents[tconst]
 	s.mu.RUnlock()
 
-	var hash, magnet, title string
+	var hash, magnet, title, targetFilePath string
 	var targetFileIdx int = -1
 
 	if mountedInfo != nil {
@@ -388,6 +484,7 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		magnet = mountedInfo.Magnet
 		title = mountedInfo.Title
 		targetFileIdx = mountedInfo.FileIndex
+		targetFilePath = mountedInfo.TargetFile
 	} else if s.playbackStore != nil {
 		// Look up in SQLite
 		lastEp, _ := s.playbackStore.GetLatestWatchedEpisode(tconst)
@@ -395,12 +492,14 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 			hash = lastEp.TorrentHash
 			magnet = lastEp.TorrentLink
 			title = lastEp.Title
+			targetFileIdx = lastEp.FileIndex
 		} else {
 			movieItem, _ := s.playbackStore.GetItemProgress(tconst, 0, 0)
 			if movieItem != nil {
 				hash = movieItem.TorrentHash
 				magnet = movieItem.TorrentLink
 				title = movieItem.Title
+				targetFileIdx = movieItem.FileIndex
 			}
 		}
 	}
@@ -425,10 +524,18 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		matched, matchErr := s.torrClient.MatchFile(rec, season, episode)
 		if matchErr == nil && matched != nil {
 			targetFileIdx = matched.ID
+			targetFilePath = matched.Path
 		}
 	}
-	if targetFileIdx < 0 {
-		targetFileIdx = 0
+	if targetFileIdx <= 0 {
+		if rec != nil && len(rec.FileStats) > 0 {
+			targetFileIdx = rec.FileStats[0].ID
+			if targetFilePath == "" {
+				targetFilePath = rec.FileStats[0].Path
+			}
+		} else {
+			targetFileIdx = 1
+		}
 	}
 
 	// Resume seconds from SQLite
@@ -442,13 +549,13 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		}
 	}
 
-	// Audio & Subtitle tracks from Probe
+	// Audio & Subtitle tracks from Probe (via ffprobe if available)
 	audioTracks := []AudioTrack{}
 	subtitleTracks := []SubtitleTrack{}
 	var videoWidth, videoHeight int
 	var videoCodec string
 
-	probe, _ := s.torrClient.ProbeFile(ctx, hash, targetFileIdx)
+	probe := s.probeStream(ctx, hash, targetFileIdx)
 	if probe != nil {
 		for _, tr := range probe.Tracks {
 			switch strings.ToLower(tr.Type) {
@@ -483,18 +590,17 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 					trackTitle = fmt.Sprintf("Субтитры #%d (%s)", tr.Index+1, strings.ToUpper(lang))
 				}
 				subtitleTracks = append(subtitleTracks, SubtitleTrack{
-					Index:       tr.Index,
-					Title:       trackTitle,
-					Language:    lang,
-					Codec:       tr.Codec,
-					IsDefault:   len(subtitleTracks) == 0,
-					DeliveryURL: fmt.Sprintf("/torr/gst/%s/subs/%d.m3u8", hash, tr.Index),
+					Index:     tr.Index,
+					Title:     trackTitle,
+					Language:  lang,
+					Codec:     tr.Codec,
+					IsDefault: len(subtitleTracks) == 0,
 				})
 			}
 		}
 	}
 
-	// Fallback audio tracks if probe not available (non-gst build)
+	// Fallback audio tracks if probe not available
 	if len(audioTracks) == 0 {
 		audioTracks = append(audioTracks, AudioTrack{
 			Index:     0,
@@ -506,10 +612,12 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		})
 	}
 
-	// Stream URL:
-	// Prioritize TorrServer GStreamer HLS master playlist on port 3000 (/torr/gst/...)
-	// Fallback directly to direct stream route (/torr/play/...)
-	streamURL := fmt.Sprintf("/torr/gst/%s/master.m3u8?index=%d&audio=0", hash, targetFileIdx)
+	// Stream URL: Direct TorrServer HTTP streaming route on port 3000 (/torr/stream/...)
+	encodedFilename := "video.mkv"
+	if targetFilePath != "" {
+		encodedFilename = url.PathEscape(filepath.Base(targetFilePath))
+	}
+	streamURL := fmt.Sprintf("/torr/stream/%s?link=%s&index=%d&play", encodedFilename, hash, targetFileIdx)
 
 	// Build Series Episodes Playlist if TV show
 	episodesList := []EpisodeInfo{}
@@ -570,12 +678,17 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		}
 	}
 
+	durationSeconds := 3600.0
+	if probe != nil && probe.DurationNS > 0 {
+		durationSeconds = float64(probe.DurationNS) / 1e9
+	}
+
 	return &PlayerInfoResponse{
 		Success:         true,
 		ItemId:          fmt.Sprintf("%s_s%d_e%d", tconst, season, episode),
 		Title:           title,
 		MediaType:       mediaType,
-		DurationSeconds: 3600, // Will be updated by player timeupdate
+		DurationSeconds: durationSeconds,
 		ResumeSeconds:   resumeSec,
 		IsPlayed:        isPlayed,
 		StreamURL:       streamURL,

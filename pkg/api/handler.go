@@ -257,8 +257,8 @@ func (h *Handler) handleSystemDiagnostic(w http.ResponseWriter, r *http.Request)
 			ver = "MatriX"
 		}
 		details := map[string]interface{}{
-			"Движок":    "TorrServer MatriX",
-			"GStreamer": "Активен (remuxing & HLS)",
+			"Движок":   "TorrServer MatriX",
+			"Стриминг": "Прямой BitTorrent HTTP стрим",
 		}
 		return ver, details
 	})
