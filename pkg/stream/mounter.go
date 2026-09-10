@@ -97,6 +97,8 @@ type Mounter struct {
 	hashResolver      HashResolver
 	adminUserId       string
 	adminUserMu       sync.RWMutex
+	lastMountTime     time.Time
+	lastMountMu       sync.RWMutex
 }
 
 func NewMounter(resolver HashResolver) *Mounter {
@@ -127,7 +129,7 @@ func NewMounter(resolver HashResolver) *Mounter {
 	}
 	indexer := os.Getenv("IMDB_INDEXER_URL")
 	if indexer == "" {
-		indexer = "http://host.docker.internal:8090"
+		indexer = "http://127.0.0.1:8090"
 	}
 
 	return &Mounter{
@@ -594,10 +596,6 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 		seasonEpCounter := make(map[int]int)
 		seenSeasons := make(map[int]bool)
 
-		versionLabel := ""
-		if strings.EqualFold(req.Mode, "add_version") || req.VersionName != "" {
-			versionLabel = determineVersionLabel(req, "1080p")
-		}
 
 		for _, f := range videoFiles {
 			sNum, epNum := parseSeasonEpisode(f.Path)
@@ -627,12 +625,10 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 			seasonSourceDir := filepath.Join(seriesSourceDir, fmt.Sprintf("Season %02d", sNum))
 			_ = os.MkdirAll(seasonSourceDir, 0755)
 
-			var epName string
-			if versionLabel != "" {
-				epName = fmt.Sprintf("%s - S%02dE%02d - %s.mkv", cleanTitle, sNum, epNum, versionLabel)
-			} else {
-				epName = fmt.Sprintf("%s - S%02dE%02d.mkv", cleanTitle, sNum, epNum)
-			}
+			// NOTE: Always use standard Jellyfin TV episode filename: cleanTitle - SxxExx.mkv
+			// Never append version labels to TV series episode filenames, as Jellyfin's series scanner
+			// relies on standard SxxExx format for episode index detection and NFO binding.
+			epName := fmt.Sprintf("%s - S%02dE%02d.mkv", cleanTitle, sNum, epNum)
 			stubPath := filepath.Join(seasonSourceDir, epName)
 			streamURL := fmt.Sprintf("http://127.0.0.1:8090/stream?link=%s&index=%d", hash, f.ID)
 
@@ -737,6 +733,10 @@ func (m *Mounter) MountTorrent(ctx context.Context, req MountRequest) (*MountRes
 			}
 		}()
 	}
+
+	m.lastMountMu.Lock()
+	m.lastMountTime = time.Now()
+	m.lastMountMu.Unlock()
 
 	return &MountResponse{
 		Success:      true,

@@ -36,6 +36,7 @@ type Handler struct {
 func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *auth.Manager, hotlistSvc *hotlist.Service) *Handler {
 	m := stream.NewMounter(agg)
 	m.StartReconciler(context.Background(), 5*time.Minute)
+	m.StartTorrentIdleReaper(context.Background(), 60*time.Second)
 	return &Handler{
 		aggregator: agg,
 		cache:      cacheStore,
@@ -79,6 +80,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stream/player/start", h.corsMiddleware(h.handlePlayerStart))
 	mux.HandleFunc("/api/stream/player/progress", h.corsMiddleware(h.handlePlayerProgress))
 	mux.HandleFunc("/api/stream/player/stop", h.corsMiddleware(h.handlePlayerStop))
+	mux.HandleFunc("/api/stream/resume", h.corsMiddleware(h.handleStreamResume))
+	mux.HandleFunc("/stream/resume", h.corsMiddleware(h.handleStreamResume))
 
 	// Jellyfin webhook endpoints
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
@@ -762,6 +765,29 @@ func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) handleStreamResume(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	items, err := h.mounter.GetResumeItems(ctx)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": fmt.Sprintf("Failed to fetch resume items: %v", err),
+			"items": []interface{}{},
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	if items == nil {
+		items = []stream.ResumeItem{}
+	}
+	_ = json.NewEncoder(w).Encode(items)
 }
 
 type loginRequest struct {

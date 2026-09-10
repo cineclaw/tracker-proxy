@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -125,6 +126,9 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	if fsURL := os.Getenv("FLARESOLVERR_URL"); fsURL != "" {
+		if !strings.HasSuffix(fsURL, "/v1") {
+			fsURL = strings.TrimRight(fsURL, "/") + "/v1"
+		}
 		cfg.FlareSolverr.URL = fsURL
 		cfg.FlareSolverr.Enabled = true
 	}
@@ -136,6 +140,8 @@ func Load(path string) (*Config, error) {
 	}
 	if cPath := os.Getenv("CACHE_PATH"); cPath != "" {
 		cfg.Cache.Path = cPath
+	} else if cDbPath := os.Getenv("CACHE_DB_PATH"); cDbPath != "" {
+		cfg.Cache.Path = cDbPath
 	}
 	if cTTL := os.Getenv("CACHE_TTL_HOURS"); cTTL != "" {
 		if ttl, err := strconv.Atoi(cTTL); err == nil {

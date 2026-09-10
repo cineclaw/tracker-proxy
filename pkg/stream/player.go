@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 type AudioTrack struct {
@@ -60,6 +62,10 @@ type PlayerInfoResponse struct {
 	CurrentEpisode  int             `json:"current_episode,omitempty"`
 	HasNextEpisode  bool            `json:"has_next_episode,omitempty"`
 	NextEpisode     *EpisodeInfo    `json:"next_episode,omitempty"`
+	Width           int             `json:"width,omitempty"`
+	Height          int             `json:"height,omitempty"`
+	Bitrate         int64           `json:"bitrate,omitempty"`
+	VideoCodec      string          `json:"video_codec,omitempty"`
 }
 
 type PlaybackStartRequest struct {
@@ -82,6 +88,8 @@ type PlaybackStopRequest struct {
 	ItemId          string  `json:"item_id"`
 	MediaSourceId   string  `json:"media_source_id,omitempty"`
 	PositionSeconds float64 `json:"position_seconds"`
+	ClosePlayer     bool    `json:"close_player,omitempty"`
+	IsPlayed        bool    `json:"is_played,omitempty"`
 }
 
 type PlaybackActionResponse struct {
@@ -160,6 +168,75 @@ func (m *Mounter) GetAdminUserId(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("no suitable user found in Jellyfin")
 }
 
+type JellyfinMediaStream struct {
+	Type         string `json:"Type"`
+	Index        int    `json:"Index"`
+	DisplayTitle string `json:"DisplayTitle"`
+	Language     string `json:"Language"`
+	Codec        string `json:"Codec"`
+	Channels     int    `json:"Channels"`
+	Width        int    `json:"Width"`
+	Height       int    `json:"Height"`
+	BitRate      int64  `json:"BitRate"`
+	IsDefault    bool   `json:"IsDefault"`
+	DeliveryURL  string `json:"DeliveryUrl,omitempty"`
+}
+
+type JellyfinMediaSource struct {
+	ID           string                `json:"Id"`
+	Container    string                `json:"Container"`
+	Bitrate      int64                 `json:"Bitrate"`
+	MediaStreams []JellyfinMediaStream `json:"MediaStreams"`
+}
+
+type JellyfinUserData struct {
+	PlaybackPositionTicks int64 `json:"PlaybackPositionTicks"`
+	Played                bool  `json:"Played"`
+}
+
+type JellyfinItem struct {
+	ID           string                `json:"Id"`
+	Name         string                `json:"Name"`
+	Type         string                `json:"Type"`
+	Path         string                `json:"Path"`
+	SeriesId     string                `json:"SeriesId,omitempty"`
+	RunTimeTicks int64                 `json:"RunTimeTicks"`
+	UserData     *JellyfinUserData     `json:"UserData"`
+	ProviderIds  map[string]string     `json:"ProviderIds"`
+	MediaSources []JellyfinMediaSource `json:"MediaSources"`
+}
+
+type rawEpisodeStream struct {
+	Type         string `json:"Type"`
+	Index        int    `json:"Index"`
+	DisplayTitle string `json:"DisplayTitle"`
+	Language     string `json:"Language"`
+	Codec        string `json:"Codec"`
+	Channels     int    `json:"Channels"`
+	Width        int    `json:"Width"`
+	Height       int    `json:"Height"`
+	BitRate      int64  `json:"BitRate"`
+	IsDefault    bool   `json:"IsDefault"`
+}
+
+type rawEpisodeMediaSource struct {
+	ID           string             `json:"Id"`
+	Container    string             `json:"Container"`
+	Bitrate      int64              `json:"Bitrate"`
+	MediaStreams []rawEpisodeStream `json:"MediaStreams"`
+}
+
+type rawEpisodeItem struct {
+	ID                string                  `json:"Id"`
+	Name              string                  `json:"Name"`
+	Path              string                  `json:"Path"`
+	IndexNumber       *int                    `json:"IndexNumber"`
+	ParentIndexNumber *int                    `json:"ParentIndexNumber"`
+	RunTimeTicks      int64                   `json:"RunTimeTicks"`
+	UserData          *JellyfinUserData       `json:"UserData"`
+	MediaSources      []rawEpisodeMediaSource `json:"MediaSources"`
+}
+
 // GetPlayerInfo finds the mounted media in Jellyfin and builds comprehensive playback info
 func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, episode int) (*PlayerInfoResponse, error) {
 	if tconst == "" {
@@ -185,89 +262,82 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 		itemsURL += fmt.Sprintf("&userId=%s", userId)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, itemsURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	if m.jellyfinAPIKey != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
-	}
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search Jellyfin items: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var jfResp struct {
-		Items []struct {
-			ID           string `json:"Id"`
-			Name         string `json:"Name"`
-			Type         string `json:"Type"`
-			Path         string `json:"Path"`
-			RunTimeTicks int64  `json:"RunTimeTicks"`
-			UserData     *struct {
-				PlaybackPositionTicks int64 `json:"PlaybackPositionTicks"`
-				Played                bool  `json:"Played"`
-			} `json:"UserData"`
-			ProviderIds map[string]string `json:"ProviderIds"`
-			MediaSources []struct {
-				ID           string `json:"Id"`
-				Container    string `json:"Container"`
-				MediaStreams []struct {
-					Type         string `json:"Type"`
-					Index        int    `json:"Index"`
-					DisplayTitle string `json:"DisplayTitle"`
-					Language     string `json:"Language"`
-					Codec        string `json:"Codec"`
-					Channels     int    `json:"Channels"`
-					IsDefault    bool   `json:"IsDefault"`
-				} `json:"MediaStreams"`
-			} `json:"MediaSources"`
-		} `json:"Items"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&jfResp); err != nil {
-		return nil, fmt.Errorf("failed to decode Jellyfin items: %w", err)
-	}
-
 	imdbPattern := fmt.Sprintf("[imdbid-%s]", tconst)
 	folderName := mountStatus.FolderName
 
-	var matchedItem *struct {
-		ID           string `json:"Id"`
-		Name         string `json:"Name"`
-		Type         string `json:"Type"`
-		Path         string `json:"Path"`
-		RunTimeTicks int64  `json:"RunTimeTicks"`
-		UserData     *struct {
-			PlaybackPositionTicks int64 `json:"PlaybackPositionTicks"`
-			Played                bool  `json:"Played"`
-		} `json:"UserData"`
-		ProviderIds map[string]string `json:"ProviderIds"`
-		MediaSources []struct {
-			ID           string `json:"Id"`
-			Container    string `json:"Container"`
-			MediaStreams []struct {
-				Type         string `json:"Type"`
-				Index        int    `json:"Index"`
-				DisplayTitle string `json:"DisplayTitle"`
-				Language     string `json:"Language"`
-				Codec        string `json:"Codec"`
-				Channels     int    `json:"Channels"`
-				IsDefault    bool   `json:"IsDefault"`
-			} `json:"MediaStreams"`
-		} `json:"MediaSources"`
+	fetchAndMatch := func() (*JellyfinItem, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, itemsURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if m.jellyfinAPIKey != "" {
+			req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+		}
+
+		resp, err := m.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search Jellyfin items: %w", err)
+		}
+		defer resp.Body.Close()
+
+		var jfResp struct {
+			Items []JellyfinItem `json:"Items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&jfResp); err != nil {
+			return nil, fmt.Errorf("failed to decode Jellyfin items: %w", err)
+		}
+
+		// 1. If looking for a TV series, prioritize items with Type == "Series"
+		if mountStatus.Type == "shows" {
+			for i := range jfResp.Items {
+				it := &jfResp.Items[i]
+				if strings.EqualFold(it.Type, "Series") {
+					if (folderName != "" && strings.Contains(it.Path, folderName)) ||
+						strings.Contains(it.Path, imdbPattern) ||
+						(it.ProviderIds != nil && strings.EqualFold(it.ProviderIds["Imdb"], tconst)) {
+						return it, nil
+					}
+				}
+			}
+		} else {
+			// 1. If looking for a Movie, prioritize items with Type == "Movie"
+			for i := range jfResp.Items {
+				it := &jfResp.Items[i]
+				if strings.EqualFold(it.Type, "Movie") {
+					if (folderName != "" && strings.Contains(it.Path, folderName)) ||
+						strings.Contains(it.Path, imdbPattern) ||
+						(it.ProviderIds != nil && strings.EqualFold(it.ProviderIds["Imdb"], tconst)) {
+						return it, nil
+					}
+				}
+			}
+		}
+
+		// 2. Fallback: match any item
+		for i := range jfResp.Items {
+			it := &jfResp.Items[i]
+			if (folderName != "" && strings.Contains(it.Path, folderName)) ||
+				strings.Contains(it.Path, imdbPattern) ||
+				(it.ProviderIds != nil && strings.EqualFold(it.ProviderIds["Imdb"], tconst)) {
+				return it, nil
+			}
+		}
+		return nil, nil
 	}
 
-	for i := range jfResp.Items {
-		it := &jfResp.Items[i]
-		if (folderName != "" && strings.Contains(it.Path, folderName)) ||
-			strings.Contains(it.Path, imdbPattern) ||
-			(it.ProviderIds != nil && strings.EqualFold(it.ProviderIds["Imdb"], tconst)) {
-			matchedItem = it
-			break
+	matchedItem, err := fetchAndMatch()
+	if err != nil {
+		return nil, err
+	}
+
+	// If not found, Jellyfin may still be scanning the library folder; retry briefly
+	for attempt := 0; attempt < 3 && matchedItem == nil; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(800 * time.Millisecond):
 		}
+		matchedItem, _ = fetchAndMatch()
 	}
 
 	if matchedItem == nil {
@@ -285,12 +355,25 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 		var audioTracks []AudioTrack
 		var subtitleTracks []SubtitleTrack
 		var mediaSourceId string
+		var videoWidth, videoHeight int
+		var videoBitrate int64
+		var videoCodec string
 
 		if len(matchedItem.MediaSources) > 0 {
 			src := matchedItem.MediaSources[0]
 			mediaSourceId = src.ID
+			if src.Bitrate > 0 {
+				videoBitrate = src.Bitrate
+			}
 			for _, stream := range src.MediaStreams {
-				if strings.EqualFold(stream.Type, "Audio") {
+				if strings.EqualFold(stream.Type, "Video") {
+					videoWidth = stream.Width
+					videoHeight = stream.Height
+					videoCodec = stream.Codec
+					if stream.BitRate > 0 {
+						videoBitrate = stream.BitRate
+					}
+				} else if strings.EqualFold(stream.Type, "Audio") {
 					title := stream.DisplayTitle
 					if title == "" {
 						title = fmt.Sprintf("Audio #%d (%s)", stream.Index, strings.ToUpper(stream.Language))
@@ -330,14 +413,25 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 			isPlayed = matchedItem.UserData.Played
 		}
 
-		// Jellyfin HLS master playlist URL
-		streamURL := fmt.Sprintf("/jellyfin/Videos/%s/master.m3u8?MediaSourceId=%s&api_key=%s",
+		// Jellyfin HLS master playlist URL with standard web audio/video codecs, fMP4 container and stream-copy
+		streamURL := fmt.Sprintf("/jellyfin/Videos/%s/master.m3u8?MediaSourceId=%s&VideoCodec=h264&AudioCodec=aac&TranscodingMaxAudioChannels=2&SegmentContainer=mp4&MinSegments=2&BreakOnNonKeyFrames=True&EnableAutoStreamCopy=true&VideoBitRate=35000000&AudioBitRate=384000&api_key=%s",
 			matchedItem.ID, mediaSourceId, m.jellyfinAPIKey)
+
+		ruTitle := ""
+		if containsCyrillic(matchedItem.Name) {
+			ruTitle = matchedItem.Name
+		} else if mountStatus.FolderName != "" {
+			parts := strings.Split(mountStatus.FolderName, " (")
+			if len(parts) > 0 && containsCyrillic(parts[0]) {
+				ruTitle = strings.TrimSpace(parts[0])
+			}
+		}
 
 		return &PlayerInfoResponse{
 			Success:         true,
 			ItemId:          matchedItem.ID,
 			Title:           matchedItem.Name,
+			RuTitle:         ruTitle,
 			MediaType:       "Movie",
 			DurationSeconds: durationSec,
 			ResumeSeconds:   resumeSec,
@@ -346,64 +440,84 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 			MediaSourceId:   mediaSourceId,
 			AudioTracks:     audioTracks,
 			Subtitles:       subtitleTracks,
+			Width:           videoWidth,
+			Height:          videoHeight,
+			Bitrate:         videoBitrate,
+			VideoCodec:      videoCodec,
 		}, nil
 	}
 
 	// TV Series: fetch all episodes from Jellyfin
 	seriesId := matchedItem.ID
+	if matchedItem.SeriesId != "" {
+		seriesId = matchedItem.SeriesId
+	}
+
 	epURL := fmt.Sprintf("%s/Shows/%s/Episodes?fields=Path,MediaSources,UserData,RunTimeTicks,Overview,IndexNumber,ParentIndexNumber",
 		m.jellyfinURL, seriesId)
 	if userId != "" {
 		epURL += fmt.Sprintf("&userId=%s", userId)
 	}
 
-	epReq, err := http.NewRequestWithContext(ctx, http.MethodGet, epURL, nil)
+	fetchEpisodes := func() ([]rawEpisodeItem, error) {
+		epReq, err := http.NewRequestWithContext(ctx, http.MethodGet, epURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if m.jellyfinAPIKey != "" {
+			epReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+		}
+
+		epResp, err := m.client.Do(epReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch episodes: %w", err)
+		}
+		defer epResp.Body.Close()
+
+		if epResp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("jellyfin returned status %d for episodes", epResp.StatusCode)
+		}
+
+		var epsData struct {
+			Items []rawEpisodeItem `json:"Items"`
+		}
+		if err := json.NewDecoder(epResp.Body).Decode(&epsData); err != nil {
+			return nil, fmt.Errorf("failed to decode episodes: %w", err)
+		}
+		return epsData.Items, nil
+	}
+
+	rawEpisodeItems, err := fetchEpisodes()
 	if err != nil {
 		return nil, err
 	}
-	if m.jellyfinAPIKey != "" {
-		epReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+
+	// If 0 episodes found, trigger targeted recursive refresh on series and retry up to 4 times
+	if len(rawEpisodeItems) == 0 {
+		refreshURL := fmt.Sprintf("%s/Items/%s/Refresh?Recursive=true", m.jellyfinURL, seriesId)
+		if refReq, err := http.NewRequestWithContext(ctx, http.MethodPost, refreshURL, nil); err == nil {
+			if m.jellyfinAPIKey != "" {
+				refReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+			}
+			if resp, err := m.client.Do(refReq); err == nil {
+				resp.Body.Close()
+			}
+		}
+
+		for attempt := 0; attempt < 4 && len(rawEpisodeItems) == 0; attempt++ {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(1000 * time.Millisecond):
+			}
+			rawEpisodeItems, _ = fetchEpisodes()
+		}
 	}
 
-	epResp, err := m.client.Do(epReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch episodes: %w", err)
-	}
-	defer epResp.Body.Close()
-
-	var epsData struct {
-		Items []struct {
-			ID                string `json:"Id"`
-			Name              string `json:"Name"`
-			IndexNumber       int    `json:"IndexNumber"`       // Episode #
-			ParentIndexNumber int    `json:"ParentIndexNumber"` // Season #
-			RunTimeTicks      int64  `json:"RunTimeTicks"`
-			UserData          *struct {
-				PlaybackPositionTicks int64 `json:"PlaybackPositionTicks"`
-				Played                bool  `json:"Played"`
-			} `json:"UserData"`
-			MediaSources []struct {
-				ID           string `json:"Id"`
-				Container    string `json:"Container"`
-				MediaStreams []struct {
-					Type         string `json:"Type"`
-					Index        int    `json:"Index"`
-					DisplayTitle string `json:"DisplayTitle"`
-					Language     string `json:"Language"`
-					Codec        string `json:"Codec"`
-					Channels     int    `json:"Channels"`
-					IsDefault    bool   `json:"IsDefault"`
-				} `json:"MediaStreams"`
-			} `json:"MediaSources"`
-		} `json:"Items"`
-	}
-
-	if err := json.NewDecoder(epResp.Body).Decode(&epsData); err != nil {
-		return nil, fmt.Errorf("failed to decode episodes: %w", err)
-	}
+	episodesMeta := m.fetchEpisodesMetadata(ctx, tconst)
 
 	var episodes []EpisodeInfo
-	for _, ep := range epsData.Items {
+	for _, ep := range rawEpisodeItems {
 		durSec := float64(ep.RunTimeTicks) / 10000000.0
 		resSec := 0.0
 		played := false
@@ -411,11 +525,55 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 			resSec = float64(ep.UserData.PlaybackPositionTicks) / 10000000.0
 			played = ep.UserData.Played
 		}
+
+		sNum := 0
+		if ep.ParentIndexNumber != nil && *ep.ParentIndexNumber > 0 {
+			sNum = *ep.ParentIndexNumber
+		}
+		epNum := 0
+		if ep.IndexNumber != nil && *ep.IndexNumber > 0 {
+			epNum = *ep.IndexNumber
+		}
+
+		// Fallback: extract season & episode from Path or Name if Jellyfin didn't provide them
+		if sNum == 0 || epNum == 0 {
+			ps, pe := parseSeasonEpisode(ep.Path)
+			if ps == 0 && pe == 0 {
+				ps, pe = parseSeasonEpisode(ep.Name)
+			}
+			if sNum == 0 {
+				sNum = ps
+			}
+			if epNum == 0 {
+				epNum = pe
+			}
+		}
+
+		// Episode name: prioritize TMDB metadata in Russian
+		epName := strings.TrimSpace(ep.Name)
+		if sMap, ok := episodesMeta[sNum]; ok {
+			if meta, ok := sMap[epNum]; ok && meta.Name != "" {
+				epName = meta.Name
+			}
+		}
+		// If epName is still raw filename (like "Укрытие - S02E01" or empty), clean it
+		if epName == "" || strings.Contains(epName, " - S") || strings.HasPrefix(strings.ToLower(epName), "s0") {
+			if sMap, ok := episodesMeta[sNum]; ok {
+				if meta, ok := sMap[epNum]; ok && meta.Name != "" {
+					epName = meta.Name
+				} else {
+					epName = fmt.Sprintf("Серия %d", epNum)
+				}
+			} else {
+				epName = fmt.Sprintf("Серия %d", epNum)
+			}
+		}
+
 		episodes = append(episodes, EpisodeInfo{
 			Id:              ep.ID,
-			Name:            ep.Name,
-			SeasonNumber:    ep.ParentIndexNumber,
-			EpisodeNumber:   ep.IndexNumber,
+			Name:            epName,
+			SeasonNumber:    sNum,
+			EpisodeNumber:   epNum,
 			DurationSeconds: durSec,
 			ResumeSeconds:   resSec,
 			IsPlayed:        played,
@@ -432,40 +590,83 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 
 	// Find the targeted episode
 	var selectedIndex = -1
-	if season > 0 && episode > 0 {
-		for i, ep := range episodes {
-			if ep.SeasonNumber == season && ep.EpisodeNumber == episode {
-				selectedIndex = i
-				break
+
+	// If a specific season was requested, check if episodes for this season exist
+	if season > 0 {
+		var seasonEpisodesCount = 0
+		for _, ep := range episodes {
+			if ep.SeasonNumber == season {
+				seasonEpisodesCount++
 			}
 		}
-	}
 
-	// If not specified or not found, find the first in-progress or unwatched episode
-	if selectedIndex == -1 {
+		if seasonEpisodesCount == 0 {
+			return &PlayerInfoResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Сезон %d еще сканируется или не смонтирован в Jellyfin. Подождите пару секунд.", season),
+			}, nil
+		}
+
+		// Find targeted episode within this season
+		if episode > 0 {
+			for i, ep := range episodes {
+				if ep.SeasonNumber == season && ep.EpisodeNumber == episode {
+					selectedIndex = i
+					break
+				}
+			}
+		}
+
+		// If specific episode wasn't found (or episode == 0), find first in-progress or unwatched IN THIS SEASON
+		if selectedIndex == -1 {
+			for i, ep := range episodes {
+				if ep.SeasonNumber == season && ep.ResumeSeconds > 0 && !ep.IsPlayed {
+					selectedIndex = i
+					break
+				}
+			}
+		}
+		if selectedIndex == -1 {
+			for i, ep := range episodes {
+				if ep.SeasonNumber == season && !ep.IsPlayed {
+					selectedIndex = i
+					break
+				}
+			}
+		}
+		if selectedIndex == -1 {
+			for i, ep := range episodes {
+				if ep.SeasonNumber == season {
+					selectedIndex = i
+					break
+				}
+			}
+		}
+	} else {
+		// No specific season requested: find first in-progress or unwatched across all seasons
 		for i, ep := range episodes {
 			if ep.ResumeSeconds > 0 && !ep.IsPlayed {
 				selectedIndex = i
 				break
 			}
 		}
-	}
-	if selectedIndex == -1 {
-		for i, ep := range episodes {
-			if !ep.IsPlayed {
-				selectedIndex = i
-				break
+		if selectedIndex == -1 {
+			for i, ep := range episodes {
+				if !ep.IsPlayed {
+					selectedIndex = i
+					break
+				}
 			}
 		}
-	}
-	if selectedIndex == -1 && len(episodes) > 0 {
-		selectedIndex = 0
+		if selectedIndex == -1 && len(episodes) > 0 {
+			selectedIndex = 0
+		}
 	}
 
 	if selectedIndex == -1 || len(episodes) == 0 {
 		return &PlayerInfoResponse{
 			Success: false,
-			Error:   "В библиотеке сериала пока не обнаружено воспроизводимых серий.",
+			Error:   "Сериал смонтирован, но Jellyfin еще сканирует серии. Подождите пару секунд и повторите.",
 		}, nil
 	}
 
@@ -478,34 +679,10 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 	}
 
 	// Find the raw episode item to extract media sources and audio/subtitle tracks
-	var rawEp *struct {
-		ID                string `json:"Id"`
-		Name              string `json:"Name"`
-		IndexNumber       int    `json:"IndexNumber"`
-		ParentIndexNumber int    `json:"ParentIndexNumber"`
-		RunTimeTicks      int64  `json:"RunTimeTicks"`
-		UserData          *struct {
-			PlaybackPositionTicks int64 `json:"PlaybackPositionTicks"`
-			Played                bool  `json:"Played"`
-		} `json:"UserData"`
-		MediaSources []struct {
-			ID           string `json:"Id"`
-			Container    string `json:"Container"`
-			MediaStreams []struct {
-				Type         string `json:"Type"`
-				Index        int    `json:"Index"`
-				DisplayTitle string `json:"DisplayTitle"`
-				Language     string `json:"Language"`
-				Codec        string `json:"Codec"`
-				Channels     int    `json:"Channels"`
-				IsDefault    bool   `json:"IsDefault"`
-			} `json:"MediaStreams"`
-		} `json:"MediaSources"`
-	}
-
-	for i := range epsData.Items {
-		if epsData.Items[i].ID == curEp.Id {
-			rawEp = &epsData.Items[i]
+	var rawEp *rawEpisodeItem
+	for i := range rawEpisodeItems {
+		if rawEpisodeItems[i].ID == curEp.Id {
+			rawEp = &rawEpisodeItems[i]
 			break
 		}
 	}
@@ -513,12 +690,25 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 	var audioTracks []AudioTrack
 	var subtitleTracks []SubtitleTrack
 	var mediaSourceId string
+	var videoWidth, videoHeight int
+	var videoBitrate int64
+	var videoCodec string
 
 	if rawEp != nil && len(rawEp.MediaSources) > 0 {
 		src := rawEp.MediaSources[0]
 		mediaSourceId = src.ID
+		if src.Bitrate > 0 {
+			videoBitrate = src.Bitrate
+		}
 		for _, stream := range src.MediaStreams {
-			if strings.EqualFold(stream.Type, "Audio") {
+			if strings.EqualFold(stream.Type, "Video") {
+				videoWidth = stream.Width
+				videoHeight = stream.Height
+				videoCodec = stream.Codec
+				if stream.BitRate > 0 {
+					videoBitrate = stream.BitRate
+				}
+			} else if strings.EqualFold(stream.Type, "Audio") {
 				title := stream.DisplayTitle
 				if title == "" {
 					title = fmt.Sprintf("Audio #%d (%s)", stream.Index, strings.ToUpper(stream.Language))
@@ -550,13 +740,33 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 		}
 	}
 
-	streamURL := fmt.Sprintf("/jellyfin/Videos/%s/master.m3u8?MediaSourceId=%s&api_key=%s",
+	streamURL := fmt.Sprintf("/jellyfin/Videos/%s/master.m3u8?MediaSourceId=%s&VideoCodec=h264&AudioCodec=aac&TranscodingMaxAudioChannels=2&SegmentContainer=mp4&MinSegments=2&BreakOnNonKeyFrames=True&EnableAutoStreamCopy=true&VideoBitRate=35000000&AudioBitRate=384000&api_key=%s",
 		curEp.Id, mediaSourceId, m.jellyfinAPIKey)
+
+	// Format natural Russian title for the episode: "Сезон 2, серия 3 — Соло"
+	var displayTitle string
+	cleanEpName := strings.TrimSpace(curEp.Name)
+	if cleanEpName != "" && !strings.EqualFold(cleanEpName, fmt.Sprintf("Серия %d", curEp.EpisodeNumber)) {
+		displayTitle = fmt.Sprintf("Сезон %d, серия %d — %s", curEp.SeasonNumber, curEp.EpisodeNumber, cleanEpName)
+	} else {
+		displayTitle = fmt.Sprintf("Сезон %d, серия %d", curEp.SeasonNumber, curEp.EpisodeNumber)
+	}
+
+	ruTitle := ""
+	if containsCyrillic(matchedItem.Name) {
+		ruTitle = matchedItem.Name
+	} else if mountStatus.FolderName != "" {
+		parts := strings.Split(mountStatus.FolderName, " (")
+		if len(parts) > 0 && containsCyrillic(parts[0]) {
+			ruTitle = strings.TrimSpace(parts[0])
+		}
+	}
 
 	return &PlayerInfoResponse{
 		Success:         true,
 		ItemId:          curEp.Id,
-		Title:           fmt.Sprintf("S%02dE%02d - %s", curEp.SeasonNumber, curEp.EpisodeNumber, curEp.Name),
+		Title:           displayTitle,
+		RuTitle:         ruTitle,
 		MediaType:       "Episode",
 		DurationSeconds: curEp.DurationSeconds,
 		ResumeSeconds:   curEp.ResumeSeconds,
@@ -570,6 +780,10 @@ func (m *Mounter) GetPlayerInfo(ctx context.Context, tconst string, season int, 
 		CurrentEpisode:  curEp.EpisodeNumber,
 		HasNextEpisode:  hasNext,
 		NextEpisode:     nextEp,
+		Width:           videoWidth,
+		Height:          videoHeight,
+		Bitrate:         videoBitrate,
+		VideoCodec:      videoCodec,
 	}, nil
 }
 
@@ -640,17 +854,35 @@ func (m *Mounter) ReportPlaybackProgress(ctx context.Context, req PlaybackProgre
 		}
 	}
 
-	// 2. Direct user progress update in Jellyfin DB
+	// 2. Direct user progress update in Jellyfin DB and PlayingItems state
 	userId, _ := m.GetAdminUserId(ctx)
 	if userId != "" {
-		userProgURL := fmt.Sprintf("%s/Users/%s/PlayingItems/%s/Progress?positionTicks=%d",
-			m.jellyfinURL, userId, req.ItemId, ticks)
-		userReq, err := http.NewRequestWithContext(ctx, http.MethodPost, userProgURL, nil)
+		// Update persistent UserData ticks in Jellyfin DB
+		userDataURL := fmt.Sprintf("%s/UserItems/%s/UserData?userId=%s", m.jellyfinURL, req.ItemId, userId)
+		dataMap := map[string]interface{}{
+			"PlaybackPositionTicks": ticks,
+			"Played":                false,
+		}
+		dataBytes, _ := json.Marshal(dataMap)
+		userReq, err := http.NewRequestWithContext(ctx, http.MethodPost, userDataURL, bytes.NewReader(dataBytes))
 		if err == nil {
+			userReq.Header.Set("Content-Type", "application/json")
 			if m.jellyfinAPIKey != "" {
 				userReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
 			}
 			if resp, err := m.client.Do(userReq); err == nil {
+				resp.Body.Close()
+			}
+		}
+
+		// Also notify active PlayingItems progress
+		itemProgURL := fmt.Sprintf("%s/PlayingItems/%s/Progress?positionTicks=%d", m.jellyfinURL, req.ItemId, ticks)
+		itemReq, err := http.NewRequestWithContext(ctx, http.MethodPost, itemProgURL, nil)
+		if err == nil {
+			if m.jellyfinAPIKey != "" {
+				itemReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+			}
+			if resp, err := m.client.Do(itemReq); err == nil {
 				resp.Body.Close()
 			}
 		}
@@ -686,21 +918,454 @@ func (m *Mounter) ReportPlaybackStop(ctx context.Context, req PlaybackStopReques
 		}
 	}
 
-	// 2. Clear active playing item and persist stopped position
+	// 2. Persist stopped position to UserData or mark played, and clear active playing item
 	userId, _ := m.GetAdminUserId(ctx)
 	if userId != "" {
-		userStopURL := fmt.Sprintf("%s/Users/%s/PlayingItems/%s?positionTicks=%d",
-			m.jellyfinURL, userId, req.ItemId, ticks)
-		userReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, userStopURL, nil)
+		if req.IsPlayed {
+			// Mark item as played in Jellyfin
+			playedURL := fmt.Sprintf("%s/UserPlayedItems/%s?userId=%s", m.jellyfinURL, req.ItemId, userId)
+			playReq, err := http.NewRequestWithContext(ctx, http.MethodPost, playedURL, nil)
+			if err == nil {
+				if m.jellyfinAPIKey != "" {
+					playReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+				}
+				if resp, err := m.client.Do(playReq); err == nil {
+					resp.Body.Close()
+				}
+			}
+		} else if ticks > 50000000 {
+			// Save stopped position in UserData only if > 5 seconds watched to prevent wiping existing progress
+			userDataURL := fmt.Sprintf("%s/UserItems/%s/UserData?userId=%s", m.jellyfinURL, req.ItemId, userId)
+			dataMap := map[string]interface{}{
+				"PlaybackPositionTicks": ticks,
+				"Played":                false,
+			}
+			dataBytes, _ := json.Marshal(dataMap)
+			userReq, err := http.NewRequestWithContext(ctx, http.MethodPost, userDataURL, bytes.NewReader(dataBytes))
+			if err == nil {
+				userReq.Header.Set("Content-Type", "application/json")
+				if m.jellyfinAPIKey != "" {
+					userReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+				}
+				if resp, err := m.client.Do(userReq); err == nil {
+					resp.Body.Close()
+				}
+			}
+		}
+
+		// Clear active playing item in Jellyfin
+		playClearURL := fmt.Sprintf("%s/PlayingItems/%s?positionTicks=%d", m.jellyfinURL, req.ItemId, ticks)
+		clearReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, playClearURL, nil)
 		if err == nil {
 			if m.jellyfinAPIKey != "" {
-				userReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+				clearReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
 			}
-			if resp, err := m.client.Do(userReq); err == nil {
+			if resp, err := m.client.Do(clearReq); err == nil {
 				resp.Body.Close()
 			}
 		}
 	}
 
+	// 3. Drop active torrent from memory in GoStorm only when player is completely closed
+	if req.ClosePlayer {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			m.DropAllWorkingTorrents(bgCtx)
+		}()
+	}
+
 	return &PlaybackActionResponse{Success: true, Message: "Playback stopped"}, nil
+}
+
+// DropAllWorkingTorrents sends an action: "drop" command to GoStorm for any torrent currently in "Torrent working" state (stat: 3)
+// This immediately frees memory and terminates active BitTorrent peer downloads/uploads.
+// When the file is next read by Jellyfin, Tiramisu FUSE will transparently re-open it.
+func (m *Mounter) DropAllWorkingTorrents(ctx context.Context) {
+	if m.gostormURL == "" {
+		return
+	}
+	listBody, _ := json.Marshal(map[string]string{"action": "list"})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.gostormURL+"/torrents", bytes.NewReader(listBody))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var torrents []struct {
+		Hash  string `json:"hash"`
+		Title string `json:"title"`
+		Stat  int    `json:"stat"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&torrents); err != nil {
+		return
+	}
+
+	for _, t := range torrents {
+		if t.Stat == 3 && t.Hash != "" { // Stat 3 = Torrent working
+			dropBody, _ := json.Marshal(map[string]string{"action": "drop", "hash": t.Hash})
+			if dReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.gostormURL+"/torrents", bytes.NewReader(dropBody)); err == nil {
+				dReq.Header.Set("Content-Type", "application/json")
+				if dResp, err := m.client.Do(dReq); err == nil {
+					dResp.Body.Close()
+					log.Printf("[player] Dropped active torrent '%s' (%s) from GoStorm memory to stop idle swarm traffic", t.Title, t.Hash)
+				}
+			}
+		}
+	}
+}
+
+// StartTorrentIdleReaper periodically monitors Jellyfin playback sessions.
+// If no sessions are actively streaming, it unloads active torrents from GoStorm memory.
+func (m *Mounter) StartTorrentIdleReaper(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sessURL := fmt.Sprintf("%s/Sessions", m.jellyfinURL)
+				sReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sessURL, nil)
+				if err != nil {
+					continue
+				}
+				if m.jellyfinAPIKey != "" {
+					sReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+				}
+				sResp, err := m.client.Do(sReq)
+				if err != nil {
+					continue
+				}
+
+				var sessions []struct {
+					NowPlayingItem *struct {
+						Id string `json:"Id"`
+					} `json:"NowPlayingItem"`
+				}
+				decodeErr := json.NewDecoder(sResp.Body).Decode(&sessions)
+				sResp.Body.Close()
+				if decodeErr != nil {
+					continue
+				}
+
+				hasActivePlayback := false
+				for _, s := range sessions {
+					if s.NowPlayingItem != nil && s.NowPlayingItem.Id != "" {
+						hasActivePlayback = true
+						break
+					}
+				}
+
+				if !hasActivePlayback {
+					m.lastMountMu.RLock()
+					lastMount := m.lastMountTime
+					m.lastMountMu.RUnlock()
+
+					// Do not drop torrents if a mount happened in the last 3 minutes
+					if !lastMount.IsZero() && time.Since(lastMount) < 3*time.Minute {
+						continue
+					}
+
+					m.DropAllWorkingTorrents(ctx)
+				}
+			}
+		}
+	}()
+}
+
+// ResumeItem represents an in-progress or next-up video item for the home screen shelf
+type ResumeItem struct {
+	ItemId           string  `json:"item_id"`
+	Tconst           string  `json:"tconst,omitempty"`
+	Title            string  `json:"title"`
+	SeriesName       string  `json:"series_name,omitempty"`
+	EpisodeTitle     string  `json:"episode_title,omitempty"`
+	MediaType        string  `json:"media_type"` // "Movie" or "Episode"
+	SeasonNumber     int     `json:"season_number,omitempty"`
+	EpisodeNumber    int     `json:"episode_number,omitempty"`
+	DurationSeconds  float64 `json:"duration_seconds"`
+	ResumeSeconds    float64 `json:"resume_seconds"`
+	PlayedPercentage float64 `json:"played_percentage"`
+	ImageUrl         string  `json:"image_url"`
+	IsNextUp         bool    `json:"is_next_up,omitempty"`
+}
+
+// GetResumeItems retrieves in-progress movies and episodes, and next-up episodes from Jellyfin.
+// Enforces that only the latest single episode per series is displayed.
+func (m *Mounter) GetResumeItems(ctx context.Context) ([]ResumeItem, error) {
+	userId, err := m.GetAdminUserId(ctx)
+	if err != nil || userId == "" {
+		return nil, fmt.Errorf("failed to get admin user id: %w", err)
+	}
+
+	imdbRegex := regexp.MustCompile(`\[imdbid-(tt\d+)\]`)
+
+	// 1. Fetch in-progress items from /UserItems/Resume
+	reqURL := fmt.Sprintf("%s/UserItems/Resume?userId=%s&fields=ProviderIds,Overview,SeriesId,SeriesName,Path", m.jellyfinURL, userId)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if m.jellyfinAPIKey != "" {
+		httpReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+	}
+
+	resp, err := m.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var resumeResp struct {
+		Items []struct {
+			Id                string `json:"Id"`
+			Name              string `json:"Name"`
+			Type              string `json:"Type"`
+			SeriesId          string `json:"SeriesId"`
+			SeriesName        string `json:"SeriesName"`
+			Path              string `json:"Path"`
+			IndexNumber       *int   `json:"IndexNumber"`
+			ParentIndexNumber *int   `json:"ParentIndexNumber"`
+			RunTimeTicks      int64  `json:"RunTimeTicks"`
+			UserData          struct {
+				PlayedPercentage      float64 `json:"PlayedPercentage"`
+				PlaybackPositionTicks int64   `json:"PlaybackPositionTicks"`
+				Played                bool    `json:"Played"`
+			} `json:"UserData"`
+			ProviderIds map[string]string `json:"ProviderIds"`
+		} `json:"Items"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&resumeResp); err != nil {
+		return nil, err
+	}
+
+	var movies []ResumeItem
+	seriesInProgressMap := make(map[string]ResumeItem)
+	seriesScoreMap := make(map[string]int)
+
+	for _, it := range resumeResp.Items {
+		if it.UserData.Played {
+			continue
+		}
+
+		durationSec := float64(it.RunTimeTicks) / 10000000.0
+		resumeSec := float64(it.UserData.PlaybackPositionTicks) / 10000000.0
+		if resumeSec <= 0 {
+			continue
+		}
+
+		tconst := ""
+		if it.ProviderIds != nil {
+			tconst = it.ProviderIds["Imdb"]
+		}
+		if tconst == "" && it.Path != "" {
+			if matches := imdbRegex.FindStringSubmatch(it.Path); len(matches) > 1 {
+				tconst = matches[1]
+			}
+		}
+
+		mediaType := it.Type
+		title := it.Name
+		seriesName := it.SeriesName
+		episodeTitle := ""
+		seasonNum := 0
+		episodeNum := 0
+
+		if mediaType == "Episode" {
+			episodeTitle = it.Name
+			if it.SeriesName != "" {
+				title = it.SeriesName
+			}
+			if it.IndexNumber != nil {
+				episodeNum = *it.IndexNumber
+			}
+			if it.ParentIndexNumber != nil {
+				seasonNum = *it.ParentIndexNumber
+			}
+
+			if tconst == "" && it.SeriesId != "" {
+				sURL := fmt.Sprintf("%s/Users/%s/Items/%s", m.jellyfinURL, userId, it.SeriesId)
+				if sReq, sErr := http.NewRequestWithContext(ctx, http.MethodGet, sURL, nil); sErr == nil {
+					if m.jellyfinAPIKey != "" {
+						sReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+					}
+					if sResp, sDoErr := m.client.Do(sReq); sDoErr == nil {
+						var sItem struct {
+							ProviderIds map[string]string `json:"ProviderIds"`
+						}
+						_ = json.NewDecoder(sResp.Body).Decode(&sItem)
+						sResp.Body.Close()
+						if sItem.ProviderIds != nil {
+							tconst = sItem.ProviderIds["Imdb"]
+						}
+					}
+				}
+			}
+		}
+
+		imgUrl := fmt.Sprintf("/jellyfin/Items/%s/Images/Primary", it.Id)
+
+		item := ResumeItem{
+			ItemId:           it.Id,
+			Tconst:           tconst,
+			Title:            title,
+			SeriesName:       seriesName,
+			EpisodeTitle:     episodeTitle,
+			MediaType:        mediaType,
+			SeasonNumber:     seasonNum,
+			EpisodeNumber:    episodeNum,
+			DurationSeconds:  durationSec,
+			ResumeSeconds:    resumeSec,
+			PlayedPercentage: it.UserData.PlayedPercentage,
+			ImageUrl:         imgUrl,
+			IsNextUp:         false,
+		}
+
+		if mediaType == "Movie" {
+			movies = append(movies, item)
+		} else {
+			seriesKey := it.SeriesId
+			if seriesKey == "" {
+				seriesKey = tconst
+			}
+			if seriesKey == "" {
+				seriesKey = seriesName
+			}
+			score := seasonNum*1000 + episodeNum
+			if prevScore, exists := seriesScoreMap[seriesKey]; !exists || score >= prevScore {
+				seriesInProgressMap[seriesKey] = item
+				seriesScoreMap[seriesKey] = score
+			}
+		}
+	}
+
+	// 2. Fetch Next Up episodes from /Shows/NextUp
+	var nextUpItems []ResumeItem
+	nextUpURL := fmt.Sprintf("%s/Shows/NextUp?userId=%s&fields=ProviderIds,Overview,SeriesId,SeriesName,Path", m.jellyfinURL, userId)
+	if nReq, nErr := http.NewRequestWithContext(ctx, http.MethodGet, nextUpURL, nil); nErr == nil {
+		if m.jellyfinAPIKey != "" {
+			nReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+		}
+		if nResp, nDoErr := m.client.Do(nReq); nDoErr == nil {
+			var nextResp struct {
+				Items []struct {
+					Id                string `json:"Id"`
+					Name              string `json:"Name"`
+					Type              string `json:"Type"`
+					SeriesId          string `json:"SeriesId"`
+					SeriesName        string `json:"SeriesName"`
+					Path              string `json:"Path"`
+					IndexNumber       *int   `json:"IndexNumber"`
+					ParentIndexNumber *int   `json:"ParentIndexNumber"`
+					RunTimeTicks      int64  `json:"RunTimeTicks"`
+					UserData          struct {
+						Played bool `json:"Played"`
+					} `json:"UserData"`
+					ProviderIds map[string]string `json:"ProviderIds"`
+				} `json:"Items"`
+			}
+			if err := json.NewDecoder(nResp.Body).Decode(&nextResp); err == nil {
+				for _, it := range nextResp.Items {
+					if it.UserData.Played {
+						continue
+					}
+
+					tconst := ""
+					if it.ProviderIds != nil {
+						tconst = it.ProviderIds["Imdb"]
+					}
+					if tconst == "" && it.Path != "" {
+						if matches := imdbRegex.FindStringSubmatch(it.Path); len(matches) > 1 {
+							tconst = matches[1]
+						}
+					}
+
+					seriesKey := it.SeriesId
+					if seriesKey == "" {
+						seriesKey = tconst
+					}
+					if seriesKey == "" {
+						seriesKey = it.SeriesName
+					}
+
+					// Only show NextUp if the series does not already have an active in-progress episode
+					if _, inProgress := seriesInProgressMap[seriesKey]; inProgress {
+						continue
+					}
+
+					durationSec := float64(it.RunTimeTicks) / 10000000.0
+					seasonNum := 0
+					episodeNum := 0
+					if it.IndexNumber != nil {
+						episodeNum = *it.IndexNumber
+					}
+					if it.ParentIndexNumber != nil {
+						seasonNum = *it.ParentIndexNumber
+					}
+
+					if tconst == "" && it.SeriesId != "" {
+						sURL := fmt.Sprintf("%s/Users/%s/Items/%s", m.jellyfinURL, userId, it.SeriesId)
+						if sReq, sErr := http.NewRequestWithContext(ctx, http.MethodGet, sURL, nil); sErr == nil {
+							if m.jellyfinAPIKey != "" {
+								sReq.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", m.jellyfinAPIKey))
+							}
+							if sResp, sDoErr := m.client.Do(sReq); sDoErr == nil {
+								var sItem struct {
+									ProviderIds map[string]string `json:"ProviderIds"`
+								}
+								_ = json.NewDecoder(sResp.Body).Decode(&sItem)
+								sResp.Body.Close()
+								if sItem.ProviderIds != nil {
+									tconst = sItem.ProviderIds["Imdb"]
+								}
+							}
+						}
+					}
+
+					title := it.Name
+					if it.SeriesName != "" {
+						title = it.SeriesName
+					}
+
+					imgUrl := fmt.Sprintf("/jellyfin/Items/%s/Images/Primary", it.Id)
+
+					nextUpItems = append(nextUpItems, ResumeItem{
+						ItemId:           it.Id,
+						Tconst:           tconst,
+						Title:            title,
+						SeriesName:       it.SeriesName,
+						EpisodeTitle:     it.Name,
+						MediaType:        "Episode",
+						SeasonNumber:     seasonNum,
+						EpisodeNumber:    episodeNum,
+						DurationSeconds:  durationSec,
+						ResumeSeconds:    0,
+						PlayedPercentage: 0,
+						ImageUrl:         imgUrl,
+						IsNextUp:         true,
+					})
+				}
+			}
+			nResp.Body.Close()
+		}
+	}
+
+	// 3. Assemble unified results: movies first, then in-progress series episodes, then next up episodes
+	var results []ResumeItem
+	results = append(results, movies...)
+	for _, ep := range seriesInProgressMap {
+		results = append(results, ep)
+	}
+	results = append(results, nextUpItems...)
+
+	return results, nil
 }
