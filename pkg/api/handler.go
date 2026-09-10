@@ -19,6 +19,7 @@ import (
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/models"
+	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
 	"tracker-proxy/pkg/version"
@@ -27,20 +28,29 @@ import (
 type Handler struct {
 	aggregator *aggregator.Aggregator
 	cache      *cache.Store
-	mounter    *stream.Mounter
+	mounter    *stream.TorrStreamService
+	playback   *playback.Store
+	nextUp     *playback.NextUpService
 	auth       *auth.Manager
 	hotlist    *hotlist.Service
 	sf         singleflight.Group
 }
 
-func NewHandler(agg *aggregator.Aggregator, cacheStore *cache.Store, authMgr *auth.Manager, hotlistSvc *hotlist.Service) *Handler {
-	m := stream.NewMounter(agg)
-	m.StartReconciler(context.Background(), 5*time.Minute)
-	m.StartTorrentIdleReaper(context.Background(), 60*time.Second)
+func NewHandler(
+	agg *aggregator.Aggregator,
+	cacheStore *cache.Store,
+	authMgr *auth.Manager,
+	hotlistSvc *hotlist.Service,
+	streamSvc *stream.TorrStreamService,
+	playStore *playback.Store,
+	nextUpSvc *playback.NextUpService,
+) *Handler {
 	return &Handler{
 		aggregator: agg,
 		cache:      cacheStore,
-		mounter:    m,
+		mounter:    streamSvc,
+		playback:   playStore,
+		nextUp:     nextUpSvc,
 		auth:       authMgr,
 		hotlist:    hotlistSvc,
 	}
@@ -83,7 +93,15 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stream/resume", h.corsMiddleware(h.handleStreamResume))
 	mux.HandleFunc("/stream/resume", h.corsMiddleware(h.handleStreamResume))
 
-	// Jellyfin webhook endpoints
+	// Native Playback & Watch History (SQLite)
+	mux.HandleFunc("/api/playback/progress", h.corsMiddleware(h.handlePlaybackProgress))
+	mux.HandleFunc("/api/playback/resume", h.corsMiddleware(h.handlePlaybackResume))
+	mux.HandleFunc("/api/playback/next-up", h.corsMiddleware(h.handlePlaybackNextUp))
+	mux.HandleFunc("/api/playback/item", h.corsMiddleware(h.handlePlaybackItem))
+	mux.HandleFunc("/api/playback/series-progress", h.corsMiddleware(h.handlePlaybackSeriesProgress))
+	mux.HandleFunc("/api/playback/delete", h.corsMiddleware(h.handlePlaybackDelete))
+
+	// Jellyfin webhook endpoints (no-op backwards compatibility)
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
 	mux.HandleFunc("/webhook/deleted", h.handleJellyfinItemDeleted)
 
@@ -121,12 +139,9 @@ func (h *Handler) handleSystemDiagnostic(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	gostormURL, jellyfinURL, indexerURL := h.mounter.GetServiceURLs()
-	if gostormURL == "" {
-		gostormURL = "http://tiramisu:8090"
-	}
-	if jellyfinURL == "" {
-		jellyfinURL = "http://jellyfin:8096"
+	torrURL, _, indexerURL := h.mounter.GetServiceURLs()
+	if torrURL == "" {
+		torrURL = "http://torrserver:8090"
 	}
 	if indexerURL == "" {
 		indexerURL = "http://imdb-indexer:8090"
@@ -152,7 +167,7 @@ func (h *Handler) handleSystemDiagnostic(w http.ResponseWriter, r *http.Request)
 		LatencyMs: 0,
 		Details: map[string]interface{}{
 			"Трекеры": "RuTracker, RuTor, NNM-Club",
-			"Кэш":     "bbolt (активен)",
+			"Кэш":     "bbolt & sqlite (активен)",
 		},
 	}
 
@@ -234,48 +249,16 @@ func (h *Handler) handleSystemDiagnostic(w http.ResponseWriter, r *http.Request)
 		return ver, details
 	})
 
-	// 3. jellyfin
+	// 3. torrserver
 	wg.Add(1)
-	go probe("jellyfin", strings.TrimRight(jellyfinURL, "/")+"/System/Info/Public", func(b []byte) (string, map[string]interface{}) {
-		ver := "10.11.x"
-		details := map[string]interface{}{}
-		var d struct {
-			Version         string `json:"Version"`
-			ServerName      string `json:"ServerName"`
-			OperatingSystem string `json:"OperatingSystem"`
+	go probe("torrserver", strings.TrimRight(torrURL, "/")+"/echo", func(b []byte) (string, map[string]interface{}) {
+		ver := strings.TrimSpace(string(b))
+		if ver == "" {
+			ver = "MatriX"
 		}
-		if err := json.Unmarshal(b, &d); err == nil {
-			if d.Version != "" {
-				ver = d.Version
-			}
-			if d.ServerName != "" {
-				details["Имя сервера"] = d.ServerName
-			}
-			if d.OperatingSystem != "" {
-				details["ОС сервера"] = d.OperatingSystem
-			}
-		}
-		return ver, details
-	})
-
-	// 4. tiramisu
-	wg.Add(1)
-	tiramisuMetricsURL := "http://tiramisu:9080/metrics"
-	go probe("tiramisu", tiramisuMetricsURL, func(b []byte) (string, map[string]interface{}) {
-		ver := "v1.9.59"
 		details := map[string]interface{}{
-			"Точка монтирования": "/media/virtual (FUSE)",
-			"Sequential stream":  "Активен",
-		}
-		var d struct {
-			Version string `json:"version"`
-			Uptime  string `json:"uptime"`
-		}
-		if err := json.Unmarshal(b, &d); err == nil && d.Version != "" {
-			ver = d.Version
-			if d.Uptime != "" {
-				details["Uptime"] = d.Uptime
-			}
+			"Движок":    "TorrServer MatriX",
+			"GStreamer": "Активен (remuxing & HLS)",
 		}
 		return ver, details
 	})
@@ -698,7 +681,7 @@ func (h *Handler) handlePlayerStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.mounter.ReportPlaybackStart(r.Context(), req)
+	res, err := h.mounter.ReportPlaybackStart(r.Context(), &req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -725,7 +708,7 @@ func (h *Handler) handlePlayerProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.mounter.ReportPlaybackProgress(r.Context(), req)
+	res, err := h.mounter.ReportPlaybackProgress(r.Context(), &req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -752,7 +735,7 @@ func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.mounter.ReportPlaybackStop(r.Context(), req)
+	res, err := h.mounter.ReportPlaybackStop(r.Context(), &req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -902,5 +885,136 @@ func (h *Handler) handleHotlist(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *Handler) handlePlaybackProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	var item playback.WatchProgressItem
+	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if h.playback != nil {
+		if err := h.playback.SaveProgress(&item); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
 
+func (h *Handler) handlePlaybackResume(w http.ResponseWriter, r *http.Request) {
+	limit := 20
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil {
+			limit = l
+		}
+	}
+	var items []playback.WatchProgressItem
+	var err error
+	if h.playback != nil {
+		items, err = h.playback.GetResumeList(limit)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if items == nil {
+		items = []playback.WatchProgressItem{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(items)
+}
 
+func (h *Handler) handlePlaybackNextUp(w http.ResponseWriter, r *http.Request) {
+	limit := 10
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil {
+			limit = l
+		}
+	}
+	var items []playback.NextUpItem
+	var err error
+	if h.nextUp != nil {
+		items, err = h.nextUp.GetNextUpItems(limit)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if items == nil {
+		items = []playback.NextUpItem{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(items)
+}
+
+func (h *Handler) handlePlaybackItem(w http.ResponseWriter, r *http.Request) {
+	imdbId := r.URL.Query().Get("imdb_id")
+	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
+	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+
+	if imdbId == "" {
+		http.Error(w, "imdb_id required", http.StatusBadRequest)
+		return
+	}
+
+	var item *playback.WatchProgressItem
+	var err error
+	if h.playback != nil {
+		item, err = h.playback.GetItemProgress(imdbId, season, episode)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if item == nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"found": false})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(item)
+}
+
+func (h *Handler) handlePlaybackSeriesProgress(w http.ResponseWriter, r *http.Request) {
+	imdbId := r.URL.Query().Get("imdb_id")
+	if imdbId == "" {
+		http.Error(w, "imdb_id required", http.StatusBadRequest)
+		return
+	}
+
+	var res map[string]playback.EpisodeProgressStatus
+	var err error
+	if h.playback != nil {
+		res, err = h.playback.GetSeriesProgress(imdbId)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if res == nil {
+		res = make(map[string]playback.EpisodeProgressStatus)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) handlePlaybackDelete(w http.ResponseWriter, r *http.Request) {
+	imdbId := r.URL.Query().Get("imdb_id")
+	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
+	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+
+	if imdbId == "" {
+		http.Error(w, "imdb_id required", http.StatusBadRequest)
+		return
+	}
+
+	if h.playback != nil {
+		_ = h.playback.DeleteItemProgress(imdbId, season, episode)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}

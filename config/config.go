@@ -14,6 +14,16 @@ type Config struct {
 	Cache        CacheConfig        `yaml:"cache"`
 	Trackers     TrackersConfig     `yaml:"trackers"`
 	Auth         AuthConfig         `yaml:"auth"`
+	TorrServer   TorrServerConfig   `yaml:"torrserver"`
+	Database     DatabaseConfig     `yaml:"database"`
+}
+
+type TorrServerConfig struct {
+	URL string `yaml:"url"`
+}
+
+type DatabaseConfig struct {
+	Path string `yaml:"path"`
 }
 
 type AuthConfig struct {
@@ -104,6 +114,12 @@ func DefaultConfig() *Config {
 			Password: "wavemp3",
 			Secret:   "",
 		},
+		TorrServer: TorrServerConfig{
+			URL: "http://127.0.0.1:8092",
+		},
+		Database: DatabaseConfig{
+			Path: "cineclaw.db",
+		},
 	}
 }
 
@@ -182,6 +198,14 @@ func Load(path string) (*Config, error) {
 	}
 	if aSecret := os.Getenv("AUTH_SECRET"); aSecret != "" {
 		cfg.Auth.Secret = aSecret
+	}
+
+	// TorrServer & SQLite Database overrides
+	if tsURL := os.Getenv("TORRSERVER_URL"); tsURL != "" {
+		cfg.TorrServer.URL = tsURL
+	}
+	if dbPath := os.Getenv("MEDIA_DB_PATH"); dbPath != "" {
+		cfg.Database.Path = dbPath
 	}
 
 	return cfg, nil

@@ -16,8 +16,11 @@ import (
 	"tracker-proxy/pkg/api"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
+	"tracker-proxy/pkg/db"
 	"tracker-proxy/pkg/flaresolverr"
 	"tracker-proxy/pkg/hotlist"
+	"tracker-proxy/pkg/playback"
+	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
 	"tracker-proxy/pkg/tracker/nnmclub"
 	"tracker-proxy/pkg/tracker/rutor"
@@ -127,9 +130,21 @@ func main() {
 	hotlistSvc := hotlist.NewService(scraper, matcher, boltDB, 2*time.Hour)
 	log.Printf("Tracker hotlist service initialized (indexer: %s)", indexerURL)
 
+	// SQLite Media & Playback Database
+	mediaDB, err := db.Open(cfg.Database.Path)
+	if err != nil {
+		log.Fatalf("Failed to open SQLite media DB at %s: %v", cfg.Database.Path, err)
+	}
+	log.Printf("SQLite media & playback database opened at %s", cfg.Database.Path)
+
+	playStore := playback.NewStore(mediaDB)
+	nextUpSvc := playback.NewNextUpService(playStore, indexerURL)
+	streamSvc := stream.NewTorrStreamService(cfg.TorrServer.URL, indexerURL, playStore, nextUpSvc)
+	log.Printf("TorrServer stream service initialized (url: %s)", cfg.TorrServer.URL)
+
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc)
+	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)
@@ -166,6 +181,12 @@ func main() {
 	if cacheStore != nil {
 		if err := cacheStore.Close(); err != nil {
 			log.Printf("Error closing cache store: %v", err)
+		}
+	}
+
+	if mediaDB != nil {
+		if err := mediaDB.Close(); err != nil {
+			log.Printf("Error closing media DB: %v", err)
 		}
 	}
 
