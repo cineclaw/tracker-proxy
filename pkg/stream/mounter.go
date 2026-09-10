@@ -95,6 +95,8 @@ type Mounter struct {
 	indexerURL        string
 	client            *http.Client
 	hashResolver      HashResolver
+	adminUserId       string
+	adminUserMu       sync.RWMutex
 }
 
 func NewMounter(resolver HashResolver) *Mounter {

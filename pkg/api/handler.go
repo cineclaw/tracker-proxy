@@ -74,6 +74,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/stream/status", h.corsMiddleware(h.handleStreamStatus))
 	mux.HandleFunc("/torrents/status", h.corsMiddleware(h.handleStreamStatus))
 
+	// Video player & progress sync endpoints
+	mux.HandleFunc("/api/stream/player/info", h.corsMiddleware(h.handlePlayerInfo))
+	mux.HandleFunc("/api/stream/player/start", h.corsMiddleware(h.handlePlayerStart))
+	mux.HandleFunc("/api/stream/player/progress", h.corsMiddleware(h.handlePlayerProgress))
+	mux.HandleFunc("/api/stream/player/stop", h.corsMiddleware(h.handlePlayerStop))
+
 	// Jellyfin webhook endpoints
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
 	mux.HandleFunc("/webhook/deleted", h.handleJellyfinItemDeleted)
@@ -651,6 +657,111 @@ func (h *Handler) handleJellyfinItemDeleted(w http.ResponseWriter, r *http.Reque
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (h *Handler) handlePlayerInfo(w http.ResponseWriter, r *http.Request) {
+	tconst := r.URL.Query().Get("tconst")
+	if tconst == "" {
+		http.Error(w, "Missing tconst parameter", http.StatusBadRequest)
+		return
+	}
+	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
+	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+
+	info, err := h.mounter.GetPlayerInfo(r.Context(), tconst, season, episode)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(info)
+}
+
+func (h *Handler) handlePlayerStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req stream.PlaybackStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.mounter.ReportPlaybackStart(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) handlePlayerProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req stream.PlaybackProgressRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.mounter.ReportPlaybackProgress(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req stream.PlaybackStopRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.mounter.ReportPlaybackStop(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 type loginRequest struct {
