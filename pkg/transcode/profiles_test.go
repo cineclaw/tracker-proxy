@@ -76,7 +76,7 @@ func TestGenerateVODPlaylist(t *testing.T) {
 	if !strings.Contains(pl, "#EXT-X-PLAYLIST-TYPE:VOD") {
 		t.Errorf("missing VOD tag: %s", pl)
 	}
-	if !strings.Contains(pl, "#EXT-X-START:TIME_OFFSET=3.000,PRECISE=YES") {
+	if !strings.Contains(pl, "#EXT-X-START:TIME-OFFSET=3.000,PRECISE=YES") {
 		t.Errorf("missing START tag: %s", pl)
 	}
 	if !strings.Contains(pl, "#EXT-X-ENDLIST") {

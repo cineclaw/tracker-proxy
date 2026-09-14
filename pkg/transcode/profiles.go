@@ -234,7 +234,7 @@ func GenerateVODPlaylist(sessionID string, durationSec float64, startSec float64
 	sb.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 
 	if startSec > 0 && startSec < durationSec {
-		sb.WriteString(fmt.Sprintf("#EXT-X-START:TIME_OFFSET=%.3f,PRECISE=YES\n", startSec))
+		sb.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", startSec))
 	}
 
 	remaining := durationSec
