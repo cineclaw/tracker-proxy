@@ -24,11 +24,11 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
 FROM alpine:latest
 
 WORKDIR /app
-RUN apk add --no-cache ca-certificates tzdata ffmpeg
+RUN apk add --no-cache ca-certificates tzdata ffmpeg tini
 
 COPY --from=builder /app/tracker-proxy /app/tracker-proxy
 
 EXPOSE 9118
 ENV CONFIG_PATH=/app/config.yaml
 
-ENTRYPOINT ["/app/tracker-proxy"]
+ENTRYPOINT ["/sbin/tini", "--", "/app/tracker-proxy"]

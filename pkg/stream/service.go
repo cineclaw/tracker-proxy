@@ -621,8 +621,10 @@ func (s *TorrStreamService) MountTorrent(ctx context.Context, req MountRequest) 
 		mountedFiles = append(mountedFiles, targetFilePath)
 	}
 
-	// Warm up probe in background so player info is instantly ready
-	if hash != "" && targetFileIdx > 0 {
+	// Warm up probe and episode indexes in background
+	if hash != "" && rec != nil && len(rec.FileStats) > 0 {
+		go s.warmupSeasonIndexes(hash, rec.FileStats, targetFileIdx)
+	} else if hash != "" && targetFileIdx > 0 {
 		go func() {
 			bgCtx, bgCancel := context.WithTimeout(context.Background(), 25*time.Second)
 			defer bgCancel()
@@ -635,6 +637,46 @@ func (s *TorrStreamService) MountTorrent(ctx context.Context, req MountRequest) 
 		Message:      "Раздача готова к мгновенному просмотру",
 		MountedFiles: mountedFiles,
 	}, nil
+}
+
+// warmupSeasonIndexes pre-probes the current episode and gently warms up the rest of the season files
+func (s *TorrStreamService) warmupSeasonIndexes(hash string, files []TorrentFileStat, priorityFileId int) {
+	if hash == "" || len(files) == 0 {
+		return
+	}
+
+	// 1. Probe the target/priority file first with high priority
+	if priorityFileId > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		s.probeStream(ctx, hash, priorityFileId)
+		cancel()
+	}
+
+	// 2. Gently warm up remaining video files in background
+	for _, fi := range files {
+		if fi.ID == priorityFileId {
+			continue
+		}
+		// Only video files >= 20MB
+		ext := strings.ToLower(filepath.Ext(fi.Path))
+		if fi.Length < 20<<20 || !videoExtensions[ext] {
+			continue
+		}
+		cacheKey := fmt.Sprintf("%s:%d", hash, fi.ID)
+		s.mu.RLock()
+		alreadyCached := s.probeCache[cacheKey] != nil
+		s.mu.RUnlock()
+		if alreadyCached {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		s.probeStream(ctx, hash, fi.ID)
+		cancel()
+
+		// Gentle pacing between files so we don't saturate network or TorrServer
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 // UnmountTorrent drops active torrent swarm from TorrServer

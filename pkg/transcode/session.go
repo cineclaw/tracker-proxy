@@ -99,17 +99,26 @@ func NewSession(
 	return sess, nil
 }
 
+func killProcessGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if runtime.GOOS != "windows" {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	} else {
+		_ = cmd.Process.Kill()
+	}
+}
+
 // startWorkerLocked launches a child FFmpeg process starting at startSegment and startSec.
 // s.mu must NOT be held by the caller if it's called externally, or s.mu must be held if called internally.
 func (s *TranscodeSession) startWorkerLocked(startSegment int, startSec float64) error {
 	if s.cancel != nil {
 		if s.isPaused && runtime.GOOS != "windows" && s.cmd != nil && s.cmd.Process != nil {
-			_ = s.cmd.Process.Signal(syscall.SIGCONT)
+			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGCONT)
 		}
 		s.cancel()
-		if s.cmd != nil && s.cmd.Process != nil {
-			_ = s.cmd.Process.Kill()
-		}
+		killProcessGroup(s.cmd)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -118,6 +127,9 @@ func (s *TranscodeSession) startWorkerLocked(startSegment int, startSec float64)
 
 	args := BuildFFmpegArgs(s.SourceURL, s.AudioIdx, startSec, startSegment, s.Profile, outputM3U8, segmentPattern)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -334,7 +346,7 @@ func (s *TranscodeSession) pauseProcess() {
 	}
 	log.Printf("[Transcode] Throttling FFmpeg session %s (buffer lead=%d)",
 		s.ID, s.highestSegmentProduced-s.lastSegmentRequested)
-	_ = s.cmd.Process.Signal(syscall.SIGSTOP)
+	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGSTOP)
 	s.isPaused = true
 }
 
@@ -345,7 +357,7 @@ func (s *TranscodeSession) resumeProcess() {
 	}
 	log.Printf("[Transcode] Resuming FFmpeg session %s (buffer lead=%d)",
 		s.ID, s.highestSegmentProduced-s.lastSegmentRequested)
-	_ = s.cmd.Process.Signal(syscall.SIGCONT)
+	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGCONT)
 	s.isPaused = false
 }
 
@@ -361,16 +373,14 @@ func (s *TranscodeSession) Stop() {
 
 	// If paused, unpause first so it can process signal
 	if s.isPaused && runtime.GOOS != "windows" && s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Signal(syscall.SIGCONT)
+		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGCONT)
 	}
 
 	if s.cancel != nil {
 		s.cancel()
 	}
 
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
+	killProcessGroup(s.cmd)
 
 	log.Printf("[Transcode] Cleaned up session %s", s.ID)
 

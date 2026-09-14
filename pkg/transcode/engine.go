@@ -81,6 +81,32 @@ func (e *TranscodeEngine) GetOrCreateSession(
 			delete(e.sessions, id)
 		}
 	}
+
+	// Enforce max 2 concurrent transcode sessions (LRU eviction) to avoid CPU exhaustion
+	for len(e.sessions) >= 2 {
+		var oldestID string
+		var oldestTime time.Time
+		var oldestSess *TranscodeSession
+		first := true
+		for id, s := range e.sessions {
+			s.mu.Lock()
+			acc := s.lastAccess
+			s.mu.Unlock()
+			if first || acc.Before(oldestTime) {
+				oldestTime = acc
+				oldestID = id
+				oldestSess = s
+				first = false
+			}
+		}
+		if oldestSess != nil {
+			log.Printf("[Transcode] Enforcing max 2 sessions: evicting LRU session %s (lastAccess %v)", oldestID, oldestTime)
+			delete(e.sessions, oldestID)
+			oldSessions = append(oldSessions, oldestSess)
+		} else {
+			break
+		}
+	}
 	e.mu.Unlock()
 
 	for _, old := range oldSessions {
