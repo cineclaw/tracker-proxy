@@ -100,6 +100,9 @@ func NewSession(
 // s.mu must NOT be held by the caller if it's called externally, or s.mu must be held if called internally.
 func (s *TranscodeSession) startWorkerLocked(startSegment int, startSec float64) error {
 	if s.cancel != nil {
+		if s.isPaused && runtime.GOOS != "windows" && s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Signal(syscall.SIGCONT)
+		}
 		s.cancel()
 		if s.cmd != nil && s.cmd.Process != nil {
 			_ = s.cmd.Process.Kill()

@@ -134,7 +134,7 @@ func BuildFFmpegArgs(
 ) []string {
 	args := []string{
 		"-hide_banner",
-		"-loglevel", "warning",
+		"-loglevel", "info",
 		"-y",
 		"-fflags", "+genpts+discardcorrupt",
 	}

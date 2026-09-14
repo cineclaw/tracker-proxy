@@ -36,7 +36,7 @@ func NewEngine(torrURL, baseDir string) *TranscodeEngine {
 		sessions:    make(map[string]*TranscodeSession),
 		torrURL:     torrURL,
 		baseDir:     baseDir,
-		idleTimeout: 5 * time.Minute,
+		idleTimeout: 90 * time.Second,
 		stopChan:    make(chan struct{}),
 	}
 
@@ -71,14 +71,30 @@ func (e *TranscodeEngine) GetOrCreateSession(
 		return existing, nil
 	}
 
+	// Terminate and clean up any other running transcode sessions for this video file.
+	// Only ONE FFmpeg transcode pipeline should run per video file to prevent CPU starvation.
+	var oldSessions []*TranscodeSession
+	for id, s := range e.sessions {
+		if s.Hash == hash && s.FileIdx == fileIdx {
+			log.Printf("[Transcode] Superseding old session %s for hash %s (new session %s)", id, hash, sessionID)
+			oldSessions = append(oldSessions, s)
+			delete(e.sessions, id)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, old := range oldSessions {
+		old.Stop()
+	}
+
 	sourceURL := fmt.Sprintf("%s/stream/video.mkv?link=%s&index=%d&play", e.torrURL, hash, fileIdx)
 
 	sess, err := NewSession(sessionID, hash, fileIdx, profile, audioIdx, startSec, durationSec, sourceURL, e.baseDir)
 	if err != nil {
-		e.mu.Unlock()
 		return nil, err
 	}
 
+	e.mu.Lock()
 	e.sessions[sessionID] = sess
 	e.mu.Unlock()
 
