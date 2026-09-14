@@ -77,8 +77,9 @@ type PlayerInfoResponse struct {
 	Height            int                 `json:"height,omitempty"`
 	Bitrate           int64               `json:"bitrate,omitempty"`
 	VideoCodec        string              `json:"video_codec,omitempty"`
-	TargetFileIdx     int                 `json:"target_file_idx"`
-	TranscodeProfiles []transcode.Profile `json:"transcode_profiles,omitempty"`
+	TargetFileIdx      int                 `json:"target_file_idx"`
+	TranscodeProfiles  []transcode.Profile `json:"transcode_profiles,omitempty"`
+	TranscodeStreamURL string              `json:"transcode_stream_url,omitempty"`
 }
 
 type MountRequest struct {
@@ -1452,9 +1453,10 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		NextEpisode:     nextEpisode,
 		Width:             videoWidth,
 		Height:            videoHeight,
-		VideoCodec:        videoCodec,
-		TargetFileIdx:     targetFileIdx,
-		TranscodeProfiles: transcode.AvailableProfiles(),
+		VideoCodec:         videoCodec,
+		TargetFileIdx:      targetFileIdx,
+		TranscodeProfiles:  transcode.AvailableProfiles(),
+		TranscodeStreamURL: fmt.Sprintf("/api/stream/transcode/%s/master.m3u8?profile=1080p&file_idx=%d&audio=%d&duration=%.2f", hash, targetFileIdx, defaultAudioIdx, durationSeconds),
 	}, nil
 }
 

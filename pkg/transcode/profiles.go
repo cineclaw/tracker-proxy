@@ -46,6 +46,17 @@ func AvailableProfiles() []Profile {
 			IsDirect:    true,
 		},
 		{
+			ID:          "1080p_high",
+			Label:       "📺 1080p HQ (10 Мбит/с)",
+			Description: "Максимальная четкость для быстрых сетей и домашних кинотеатров",
+			MaxHeight:   1080,
+			BitrateKbps: 10000,
+			MaxRateKbps: 11000,
+			BufSizeKbps: 20000,
+			AudioKbps:   256,
+			IsDirect:    false,
+		},
+		{
 			ID:          "1080p",
 			Label:       "📱 1080p Full HD (6 Мбит/с)",
 			Description: "Для скоростного Wi-Fi и больших экранов",
@@ -152,16 +163,19 @@ func BuildFFmpegArgs(
 
 	// Video scaling and encoding:
 	// - Closed GOP (+cgop) eliminates any cross-segment reference decoding glitches.
-	// - Force keyframes at exact 3-second boundaries.
-	// - High quality veryfast preset with 2 B-frames for smooth, glitch-free bitrate distribution.
+	// - Force keyframes at exact 3-second boundaries (75 frames at 25fps).
+	// - Veryfast preset with zerolatency tuning for instant initial frame delivery.
 	scaleFilter := fmt.Sprintf("scale=w=-2:h=min(%d\\,ih)", profile.MaxHeight)
 	args = append(args,
 		"-c:v", "libx264",
 		"-preset", "veryfast",
+		"-tune", "zerolatency",
 		"-profile:v", "main",
 		"-level", "4.1",
 		"-pix_fmt", "yuv420p",
 		"-flags", "+cgop",
+		"-g", "75",
+		"-keyint_min", "75",
 		"-force_key_frames", "expr:gte(t,n_forced*3)",
 		"-vf", scaleFilter,
 		"-b:v", fmt.Sprintf("%dk", profile.BitrateKbps),

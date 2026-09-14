@@ -7,8 +7,8 @@ import (
 
 func TestAvailableProfiles(t *testing.T) {
 	profiles := AvailableProfiles()
-	if len(profiles) != 6 {
-		t.Fatalf("expected 6 profiles, got %d", len(profiles))
+	if len(profiles) != 7 {
+		t.Fatalf("expected 7 profiles, got %d", len(profiles))
 	}
 
 	direct := profiles[0]
