@@ -2,6 +2,8 @@ package stream
 
 import (
 	"testing"
+
+	"tracker-proxy/pkg/models"
 )
 
 func TestSelectDefaultAudioTrack(t *testing.T) {
@@ -57,5 +59,73 @@ func TestSelectDefaultAudioTrack(t *testing.T) {
 				t.Errorf("expected index %d, got %d", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestFilterCandidates(t *testing.T) {
+	metaRunner2026 := &IndexerMeta{
+		Tconst:        "tt31349844",
+		Title:         "Курьер",
+		OriginalTitle: "Runner",
+		Year:          2026,
+	}
+
+	candidates := []models.TorrentResult{
+		{
+			Title: "Курьер (Карен Шахназаров) [1986, СССР, драма, WEB-DL 1080p]",
+			Seeds: 50,
+		},
+		{
+			Title: "Курьер / The Courier (Закари Адлер) [2019, США, боевик, BDRip 1080p]",
+			Seeds: 15,
+		},
+		{
+			Title: "Курьер / El correo / The Courier (Даниэль Кальпарсоро) [2024, Испания, WEB-DLRip]",
+			Seeds: 34,
+		},
+		{
+			Title: "Курьер. Доставить любой ценой (2025) WEB-DL [H.264/1080p]",
+			Seeds: 2,
+		},
+		{
+			Title: "Дмитрий Ра, Вова Бо - Запечатанный мир 1, Имперский Курьер. Том 1 (2025) МР3",
+			Seeds: 4,
+		},
+	}
+
+	filtered := FilterCandidates(candidates, metaRunner2026, 0, "movie", 2026)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 candidate for Runner 2026, got %d", len(filtered))
+	}
+	if filtered[0].Title != "Курьер. Доставить любой ценой (2025) WEB-DL [H.264/1080p]" {
+		t.Errorf("unexpected filtered title: %s", filtered[0].Title)
+	}
+
+	// TV Series test
+	metaBreakingBad := &IndexerMeta{
+		Tconst:        "tt0903747",
+		Title:         "Во все тяжкие",
+		OriginalTitle: "Breaking Bad",
+		Year:          2008,
+	}
+
+	tvCandidates := []models.TorrentResult{
+		{
+			Title: "Во все тяжкие / Breaking Bad / Сезон: 1 [2008, США, BDRip-AVC]",
+			Seeds: 20,
+		},
+		{
+			Title: "Во все тяжкие / Breaking Bad / Сезоны: 1-5 [2008-2013, США, BDRip 720p]",
+			Seeds: 45,
+		},
+		{
+			Title: "Во все тяжкие [1985, драма, BDRip]",
+			Seeds: 10,
+		},
+	}
+
+	filteredTV := FilterCandidates(tvCandidates, metaBreakingBad, 0, "tv", 2008)
+	if len(filteredTV) != 2 {
+		t.Fatalf("expected 2 candidates for Breaking Bad, got %d", len(filteredTV))
 	}
 }

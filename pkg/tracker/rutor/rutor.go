@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/models"
 )
 
@@ -83,7 +84,6 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to parse rutor html: %w", err)
 	}
 
-	var nonVideoRegex = regexp.MustCompile(`(?i)(\b(flac|lossless|alac|ape|soundtrack|ost|audiobook|аудиокнига|repack by|gog|pc game|crack|patch|pdf|fb2|epub|djvu)\b|\[(flac|mp3|lossless|pc|iso|android|ios)\])`)
 	var results []models.TorrentResult
 
 	doc.Find("div#index table tr").Each(func(i int, s *goquery.Selection) {
@@ -94,8 +94,8 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		}
 
 		title := strings.TrimSpace(titleLink.Text())
-		if nonVideoRegex.MatchString(title) {
-			return // skip music, books, games, software
+		if hotlist.IsNonVideo(title) {
+			return // skip music, books, audiobooks, games, software
 		}
 		href, _ := titleLink.Attr("href")
 		detailsURL := t.baseURL + href

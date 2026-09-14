@@ -367,13 +367,17 @@ func filterAndRankBySeason(results []models.TorrentResult, season int) []models.
 	return append(tier1, tier2...)
 }
 
-func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType string, season int, refreshCache bool, limit int) ([]models.TorrentResult, string) {
+func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType string, season int, targetYear int, refreshCache bool, limit int) ([]models.TorrentResult, string) {
 	normIMDb := cache.NormalizeIMDbID(imdbID)
 	cacheStatus := "BYPASS"
 
 	var meta *stream.IndexerMeta
 	if normIMDb != "" && h.mounter != nil {
 		meta = h.mounter.FetchIndexerMeta(ctx, normIMDb)
+	}
+
+	if targetYear <= 0 && meta != nil && meta.Year > 0 {
+		targetYear = meta.Year
 	}
 
 	// Auto-resolve title from IMDb indexer if queryStr is empty
@@ -421,7 +425,8 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 				}
 			}
 			filtered := filterAndRankBySeason(cached, season)
-			if meta != nil {
+			if meta != nil || targetYear > 0 {
+				filtered = stream.FilterCandidates(filtered, meta, season, mediaType, targetYear)
 				sort.SliceStable(filtered, func(i, j int) bool {
 					return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
 				})
@@ -470,7 +475,8 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 		if err == nil && v != nil {
 			results := v.([]models.TorrentResult)
 			filtered := filterAndRankBySeason(results, season)
-			if meta != nil {
+			if meta != nil || targetYear > 0 {
+				filtered = stream.FilterCandidates(filtered, meta, season, mediaType, targetYear)
 				sort.SliceStable(filtered, func(i, j int) bool {
 					return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
 				})
@@ -492,7 +498,8 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 		Limit: limit,
 	})
 	filtered := filterAndRankBySeason(results, season)
-	if meta != nil {
+	if meta != nil || targetYear > 0 {
+		filtered = stream.FilterCandidates(filtered, meta, season, mediaType, targetYear)
 		sort.SliceStable(filtered, func(i, j int) bool {
 			return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
 		})
@@ -540,11 +547,18 @@ func (h *Handler) handleJSONSearch(w http.ResponseWriter, r *http.Request) {
 		mediaType = strings.TrimSpace(r.URL.Query().Get("media_type"))
 	}
 
+	targetYear := 0
+	if y := r.URL.Query().Get("year"); y != "" {
+		if val, err := strconv.Atoi(y); err == nil && val > 0 {
+			targetYear = val
+		}
+	}
+
 	start := time.Now()
-	results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, mediaType, season, refreshCache, limit)
+	results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, mediaType, season, targetYear, refreshCache, limit)
 	duration := time.Since(start)
 
-	log.Printf("[search] query=%q imdb_id=%q type=%q season=%d cache=%s returned=%d duration=%v", queryStr, imdbID, mediaType, season, cacheStatus, len(results), duration)
+	log.Printf("[search] query=%q imdb_id=%q type=%q season=%d year=%d cache=%s returned=%d duration=%v", queryStr, imdbID, mediaType, season, targetYear, cacheStatus, len(results), duration)
 
 	w.Header().Set("X-Cache", cacheStatus)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -597,12 +611,19 @@ func (h *Handler) handleTorznab(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		targetYear := 0
+		if y := r.URL.Query().Get("year"); y != "" {
+			if val, err := strconv.Atoi(y); err == nil && val > 0 {
+				targetYear = val
+			}
+		}
+
 		start := time.Now()
-		results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, torznabType, season, refreshCache, limit)
+		results, cacheStatus := h.executeSearch(r.Context(), queryStr, imdbID, torznabType, season, targetYear, refreshCache, limit)
 
 		duration := time.Since(start)
 
-		log.Printf("[torznab] t=%s query=%q imdb_id=%q season=%d cache=%s returned=%d duration=%v", t, queryStr, imdbID, season, cacheStatus, len(results), duration)
+		log.Printf("[torznab] t=%s query=%q imdb_id=%q season=%d year=%d cache=%s returned=%d duration=%v", t, queryStr, imdbID, season, targetYear, cacheStatus, len(results), duration)
 
 		w.Header().Set("X-Cache", cacheStatus)
 		RenderTorznabFeed(w, results)

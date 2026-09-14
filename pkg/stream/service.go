@@ -799,16 +799,38 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 	}
 
 	if meta != nil {
-		cRus, cOrig, cYear, _, _ := hotlist.ParseReleaseTitle(c.Title)
+		cRus, cOrig, cStartYear, cEndYear, isOngoing, _, _ := hotlist.ParseReleaseDetails(c.Title)
 
 		// 1. Year matching (crucial for movies and disambiguation)
-		if meta.Year > 0 && cYear > 0 {
-			if cYear == meta.Year {
-				score += 500 // exact year match
-			} else if cYear == meta.Year-1 || cYear == meta.Year+1 {
-				score += 150 // acceptable boundary year (festival release vs tracker upload)
-			} else {
-				score -= 2000 // major year mismatch! (e.g. 2023 vs 2026)
+		if meta.Year > 0 {
+			if cStartYear > 0 {
+				if cStartYear == meta.Year {
+					score += 600 // exact year match
+				} else if cStartYear == meta.Year-1 || cStartYear == meta.Year+1 {
+					score += 300 // acceptable boundary year (festival release vs tracker upload)
+				} else if season <= 0 {
+					// Major movie year mismatch
+					diff := cStartYear - meta.Year
+					if diff < 0 {
+						diff = -diff
+					}
+					score -= diff * 500
+				} else {
+					// For series, check if release year is within series range
+					currentYear := time.Now().Year()
+					if cStartYear >= meta.Year-1 && cStartYear <= currentYear+1 {
+						score += 200 // TV series release within valid air timeline
+					} else {
+						score -= 2000 // Year is from before the TV show even existed!
+					}
+				}
+			}
+			// Bonus for multi-year TV packs
+			if season > 0 && cEndYear > cStartYear && cStartYear >= meta.Year-1 {
+				score += 250 // complete pack
+			}
+			if season > 0 && isOngoing {
+				score += 150
 			}
 		}
 
@@ -820,8 +842,8 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 					score += 600 // exact original title found in release
 				} else if cOrig != "" && strings.EqualFold(cOrig, origClean) {
 					score += 600
-				} else if cOrig != "" && !strings.Contains(strings.ToLower(cOrig), origClean) {
-					score -= 1000 // candidate has a completely different original title!
+				} else if cOrig != "" && !strings.Contains(strings.ToLower(cOrig), origClean) && !strings.Contains(origClean, strings.ToLower(cOrig)) {
+					score -= 3000 // candidate has a completely different original title!
 				}
 			}
 		}
@@ -835,8 +857,7 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 					if cRusLower == rusClean {
 						score += 400 // exact Russian title match
 					} else if strings.HasPrefix(cRusLower, rusClean+" ") || strings.Contains(cRusLower, " "+rusClean) {
-						// e.g. "приглашение к убийству" vs "приглашение"
-						score -= 400
+						score += 150
 					}
 				}
 			}
@@ -845,11 +866,102 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 
 	if season > 0 {
 		if len(c.Seasons) == 1 && c.Seasons[0] == season {
-			score += 100
+			score += 150
 		}
 	}
 
 	return score
+}
+
+// FilterCandidates filters out candidates that do not match the target year, timeline, or titles.
+func FilterCandidates(candidates []models.TorrentResult, meta *IndexerMeta, season int, mediaType string, targetYear int) []models.TorrentResult {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	if targetYear <= 0 && meta != nil && meta.Year > 0 {
+		targetYear = meta.Year
+	}
+
+	isSeries := mediaType == "tv" || mediaType == "tvSeries" || mediaType == "tvMiniSeries" || season > 0
+	currentYear := time.Now().Year()
+
+	var metaOrig, metaRus string
+	if meta != nil {
+		metaOrig = strings.ToLower(strings.TrimSpace(meta.OriginalTitle))
+		metaRus = strings.ToLower(strings.TrimSpace(meta.Title))
+	}
+
+	var valid []models.TorrentResult
+	for _, c := range candidates {
+		// 0. Drop non-video candidates (audiobooks, MP3, music, books, software)
+		if hotlist.IsNonVideo(c.Title) {
+			continue
+		}
+
+		cRus, cOrig, cStartYear, cEndYear, isOngoing, _, _ := hotlist.ParseReleaseDetails(c.Title)
+		normCOrig := strings.ToLower(strings.TrimSpace(cOrig))
+		normCRus := strings.ToLower(strings.TrimSpace(cRus))
+		titleLower := strings.ToLower(c.Title)
+
+		// 1. Conflicting original title check
+		if metaOrig != "" && normCOrig != "" && len(metaOrig) >= 3 && len(normCOrig) >= 3 {
+			// If both have an original title and they don't contain each other, it is a different film/series
+			if !strings.Contains(normCOrig, metaOrig) && !strings.Contains(metaOrig, normCOrig) {
+				continue
+			}
+		}
+
+		// 2. Temporal filtering
+		if targetYear > 0 {
+			if !isSeries {
+				// Movie: Strict year range [targetYear - 1, targetYear + 1]
+				if cStartYear > 0 {
+					diff := cStartYear - targetYear
+					if diff < -1 || diff > 1 {
+						// e.g. targetYear = 2026, release is 2024, 2019, 1986 -> Disqualified
+						continue
+					}
+				} else {
+					// Year wasn't parsed from title. If original title contradicts, drop.
+					if metaOrig != "" && normCOrig != "" && !strings.Contains(normCOrig, metaOrig) && !strings.Contains(metaOrig, normCOrig) {
+						continue
+					}
+					// If neither Russian title nor original title is present in candidate title, drop
+					if metaRus != "" && !strings.Contains(titleLower, metaRus) && (metaOrig == "" || !strings.Contains(titleLower, metaOrig)) {
+						continue
+					}
+				}
+			} else {
+				// TV Series: timeline spans from series start up to present/end
+				seriesStart := targetYear
+				seriesEnd := targetYear
+				if seriesEnd < currentYear {
+					seriesEnd = currentYear
+				}
+
+				if cStartYear > 0 {
+					// Disqualify if release was produced earlier than series start (with 1 yr margin)
+					if cStartYear < seriesStart-1 {
+						continue
+					}
+					// If release has end year and it was before series start, disqualify
+					if cEndYear > 0 && cEndYear < seriesStart-1 {
+						continue
+					}
+					// If release year is far in the future
+					if cStartYear > seriesEnd+1 && !isOngoing {
+						continue
+					}
+				}
+			}
+		}
+
+		_ = normCRus
+		valid = append(valid, c)
+	}
+
+	return valid
 }
 
 // autoResolveTorrent finds and resolves the best available torrent for a title/season
@@ -946,6 +1058,19 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 		}
 	} else {
 		pool = candidates
+	}
+
+	targetMediaType := "movie"
+	if season > 0 {
+		targetMediaType = "tv"
+	}
+	targetYear := 0
+	if meta != nil {
+		targetYear = meta.Year
+	}
+	pool = FilterCandidates(pool, meta, season, targetMediaType, targetYear)
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("нет подходящих раздач для %s (год/название не совпали)", tconst)
 	}
 
 	sort.Slice(pool, func(i, j int) bool {
