@@ -194,8 +194,8 @@ func (s *TranscodeSession) monitorStderr(r interface{ Read([]byte) (int, error) 
 					s.highestSegmentProduced = num
 				}
 				lead := s.highestSegmentProduced - s.lastSegmentRequested
-				// If FFmpeg is > 10 segments (~30s) ahead of player, pause it
-				if lead > 10 && !s.isPaused && !s.closed {
+				// If FFmpeg is > 35 segments (~105s) ahead of player, pause it
+				if lead > 35 && !s.isPaused && !s.closed {
 					s.pauseProcess()
 				}
 				s.mu.Unlock()
@@ -223,9 +223,9 @@ func (s *TranscodeSession) Touch(segNum int) {
 		s.lastSegmentRequested = segNum
 	}
 
-	// If player is catching up (< 5 segments buffer ahead), resume FFmpeg
+	// If player is catching up (< 15 segments buffer ahead), resume FFmpeg
 	lead := s.highestSegmentProduced - s.lastSegmentRequested
-	if lead <= 4 && s.isPaused && !s.closed {
+	if lead <= 15 && s.isPaused && !s.closed {
 		s.resumeProcess()
 	}
 }
