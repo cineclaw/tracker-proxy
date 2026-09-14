@@ -36,7 +36,7 @@ func NewEngine(torrURL, baseDir string) *TranscodeEngine {
 		sessions:    make(map[string]*TranscodeSession),
 		torrURL:     torrURL,
 		baseDir:     baseDir,
-		idleTimeout: 35 * time.Second,
+		idleTimeout: 5 * time.Minute,
 		stopChan:    make(chan struct{}),
 	}
 
@@ -47,7 +47,7 @@ func NewEngine(torrURL, baseDir string) *TranscodeEngine {
 // BuildSessionID generates a deterministic or unique session identifier.
 func BuildSessionID(hash string, fileIdx int, profile Profile, audioIdx int, customID string) string {
 	if customID != "" {
-		return fmt.Sprintf("%s_%s_%d", customID, profile.ID, audioIdx)
+		return fmt.Sprintf("%s_%d_%s_%d_%s", hash, fileIdx, profile.ID, audioIdx, customID)
 	}
 	return fmt.Sprintf("%s_%d_%s_%d", hash, fileIdx, profile.ID, audioIdx)
 }

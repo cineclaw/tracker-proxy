@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1509,6 +1510,31 @@ func (h *Handler) handleTranscodeSegment(w http.ResponseWriter, r *http.Request)
 	filename := parts[1]
 
 	sess := h.transcode.GetSession(sessionID)
+	if sess == nil {
+		// Session revival: sessionID format: {hash}_{fileIdx}_{profile}_{audioIdx}[_{customID}]
+		idParts := strings.Split(sessionID, "_")
+		if len(idParts) >= 4 {
+			hash := idParts[0]
+			fileIdx, _ := strconv.Atoi(idParts[1])
+			profile := transcode.GetProfile(idParts[2])
+			audioIdx, _ := strconv.Atoi(idParts[3])
+			customID := ""
+			if len(idParts) >= 5 {
+				customID = strings.Join(idParts[4:], "_")
+			}
+			segNum := 0
+			if matches := regexp.MustCompile(`seg_(\d+)\.ts`).FindStringSubmatch(filename); len(matches) > 1 {
+				segNum, _ = strconv.Atoi(matches[1])
+			}
+			startSec := float64(segNum) * 3.0
+			log.Printf("[Transcode] Reviving expired/missing session %s at seg %d (start=%.1fs)", sessionID, segNum, startSec)
+			var err error
+			sess, err = h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, 7200.0, customID)
+			if err != nil {
+				log.Printf("[Transcode] Failed to revive session %s: %v", sessionID, err)
+			}
+		}
+	}
 	if sess == nil {
 		http.Error(w, "Transcode session not found or expired", http.StatusNotFound)
 		return

@@ -264,7 +264,11 @@ func (s *TranscodeSession) GetSegment(filename string) ([]byte, error) {
 		maxForward = activeStart + 20
 	}
 
-	if segNum < activeStart || segNum > maxForward {
+	// Guard against demuxer probing: If a demuxer probes segment 0 or 1 at session startup,
+	// do NOT abort the active worker that is transcoding at activeStart.
+	isDemuxerProbe := (segNum <= 1 && activeStart > 2 && time.Since(s.createdAt) < 25*time.Second)
+
+	if !isDemuxerProbe && (segNum < activeStart || segNum > maxForward) {
 		seekStartSec := float64(segNum) * 3.0
 		log.Printf("[Transcode] Seek detected in session %s: requested seg %d (active=[%d..%d], horizon=%d), seeking to %.1fs",
 			s.ID, segNum, activeStart, highest, maxForward, seekStartSec)
@@ -274,6 +278,13 @@ func (s *TranscodeSession) GetSegment(filename string) ([]byte, error) {
 		}
 	}
 	s.mu.Unlock()
+
+	targetWaitFile := segPath
+	if isDemuxerProbe {
+		// Demuxer only needs any valid TS segment from this stream to probe codecs/dimensions/PID.
+		// Wait for the activeStart segment that the worker is actively producing.
+		targetWaitFile = filepath.Join(s.OutputDir, fmt.Sprintf("seg_%04d.ts", activeStart))
+	}
 
 	// Wait up to 45 seconds for segment to appear on disk (cold BitTorrent seek may take ~20-30s)
 	deadline := time.Now().Add(45 * time.Second)
@@ -290,7 +301,7 @@ func (s *TranscodeSession) GetSegment(filename string) ([]byte, error) {
 			return nil, startErr
 		}
 
-		if data, err := os.ReadFile(segPath); err == nil && len(data) > 0 {
+		if data, err := os.ReadFile(targetWaitFile); err == nil && len(data) > 0 {
 			return data, nil
 		}
 		time.Sleep(40 * time.Millisecond)
