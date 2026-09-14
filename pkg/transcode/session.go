@@ -70,6 +70,9 @@ func NewSession(
 	}
 
 	startSegment := int(startSec / 3.0)
+	if startSegment > 0 {
+		startSegment-- // Start 1 segment earlier so preceding boundary/keyframe segment is ready
+	}
 	workerStartSec := float64(startSegment) * 3.0
 
 	sess := &TranscodeSession{
@@ -267,11 +270,13 @@ func (s *TranscodeSession) GetSegment(filename string) ([]byte, error) {
 		maxForward = activeStart + 20
 	}
 
-	// Guard against demuxer probing: If a demuxer probes segment 0 or 1 at session startup,
+	// Guard against demuxer probing or boundary requests: If a demuxer probes segment 0 or 1,
+	// or requests the boundary segment (activeStart - 1) at session startup,
 	// do NOT abort the active worker that is transcoding at activeStart.
 	isDemuxerProbe := (segNum <= 1 && activeStart > 2 && time.Since(s.createdAt) < 25*time.Second)
+	isBoundaryProbe := (segNum == activeStart-1 && time.Since(s.createdAt) < 25*time.Second)
 
-	if !isDemuxerProbe && (segNum < activeStart || segNum > maxForward) {
+	if !isDemuxerProbe && !isBoundaryProbe && (segNum < activeStart-1 || segNum > maxForward) {
 		seekStartSec := float64(segNum) * 3.0
 		log.Printf("[Transcode] Seek detected in session %s: requested seg %d (active=[%d..%d], horizon=%d), seeking to %.1fs",
 			s.ID, segNum, activeStart, highest, maxForward, seekStartSec)
@@ -283,10 +288,12 @@ func (s *TranscodeSession) GetSegment(filename string) ([]byte, error) {
 	s.mu.Unlock()
 
 	targetWaitFile := segPath
-	if isDemuxerProbe {
-		// Demuxer only needs any valid TS segment from this stream to probe codecs/dimensions/PID.
-		// Wait for the activeStart segment that the worker is actively producing.
-		targetWaitFile = filepath.Join(s.OutputDir, fmt.Sprintf("seg_%04d.ts", activeStart))
+	if isDemuxerProbe || isBoundaryProbe {
+		// Demuxer only needs any valid TS segment from this stream to probe codecs/dimensions/PID or boundary.
+		// Wait for the activeStart segment that the worker is actively producing if boundary is not ready.
+		if _, err := os.Stat(segPath); err != nil {
+			targetWaitFile = filepath.Join(s.OutputDir, fmt.Sprintf("seg_%04d.ts", activeStart))
+		}
 	}
 
 	// Wait up to 45 seconds for segment to appear on disk (cold BitTorrent seek may take ~20-30s)

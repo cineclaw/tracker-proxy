@@ -168,7 +168,7 @@ func BuildFFmpegArgs(
 	scaleFilter := fmt.Sprintf("scale=w=-2:h=min(%d\\,ih)", profile.MaxHeight)
 	args = append(args,
 		"-c:v", "libx264",
-		"-preset", "veryfast",
+		"-preset", "superfast",
 		"-tune", "zerolatency",
 		"-profile:v", "main",
 		"-level", "4.1",
