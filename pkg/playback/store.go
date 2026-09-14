@@ -437,6 +437,8 @@ func (s *Store) GetSeriesProgress(imdbId string) (map[string]EpisodeProgressStat
 		st.IsCompleted = completedInt == 1
 		key := fmt.Sprintf("%dx%d", st.SeasonNumber, st.EpisodeNumber)
 		result[key] = st
+		keyUnderscore := fmt.Sprintf("%d_%d", st.SeasonNumber, st.EpisodeNumber)
+		result[keyUnderscore] = st
 	}
 
 	return result, nil
@@ -756,14 +758,17 @@ func (s *Store) MarkSeasonWatched(imdbId, title, poster, backdrop string, season
 	return nil
 }
 
-// MarkAllUpToEpisodeWatched marks all episodes in all seasons up to the specified episode as watched
+// MarkAllUpToEpisodeWatched marks all episodes in all seasons strictly prior to the specified episode as watched
 func (s *Store) MarkAllUpToEpisodeWatched(imdbId, title, poster, backdrop string, upToSeason, upToEpisode int, episodes []TmdbEpisodeItem) error {
 	if imdbId == "" || upToSeason <= 0 || upToEpisode <= 0 {
 		return fmt.Errorf("invalid up_to parameters")
 	}
 
 	for _, ep := range episodes {
-		if ep.SeasonNumber < upToSeason || (ep.SeasonNumber == upToSeason && ep.EpisodeNumber <= upToEpisode) {
+		if ep.SeasonNumber <= 0 {
+			continue
+		}
+		if ep.SeasonNumber < upToSeason || (ep.SeasonNumber == upToSeason && ep.EpisodeNumber < upToEpisode) {
 			_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, ep.SeasonNumber, ep.EpisodeNumber, ep.Name, ep.StillPath, true)
 		}
 	}

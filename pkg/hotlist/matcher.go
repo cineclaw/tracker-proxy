@@ -216,6 +216,16 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 	return result
 }
 
+func cleanHotlistQuery(s string) string {
+	s = strings.ReplaceAll(s, "&", " and ")
+	s = strings.ReplaceAll(s, "/", " ")
+	s = strings.ReplaceAll(s, ":", " ")
+	s = strings.ReplaceAll(s, "!", " ")
+	s = strings.ReplaceAll(s, "?", " ")
+	s = strings.ReplaceAll(s, "\"", " ")
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+}
+
 func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *IndexerHit {
 	// Query priority: OriginalTitle > RussianTitle
 	queries := []string{}
@@ -231,16 +241,20 @@ func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *I
 		titleType = "tvSeries"
 	}
 
-	for _, q := range queries {
+	doSearch := func(query string, withYear bool) *IndexerHit {
+		qClean := cleanHotlistQuery(query)
+		if qClean == "" {
+			return nil
+		}
 		u, err := url.Parse(fmt.Sprintf("%s/search", strings.TrimRight(m.indexerURL, "/")))
 		if err != nil {
-			continue
+			return nil
 		}
 		params := url.Values{}
-		params.Set("q", q)
+		params.Set("q", qClean)
 		params.Set("type", titleType)
 		params.Set("limit", "2")
-		if t.Year > 1900 {
+		if withYear && t.Year > 1900 {
 			params.Set("year_from", fmt.Sprintf("%d", t.Year-1))
 			params.Set("year_to", fmt.Sprintf("%d", t.Year+1))
 		}
@@ -248,20 +262,31 @@ func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *I
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
-			continue
+			return nil
 		}
-
 		resp, err := m.client.Do(req)
 		if err != nil {
-			continue
+			return nil
 		}
+		defer resp.Body.Close()
 
 		var searchResp IndexerSearchResponse
-		err = json.NewDecoder(resp.Body).Decode(&searchResp)
-		resp.Body.Close()
-
-		if err == nil && len(searchResp.Hits) > 0 {
+		if err := json.NewDecoder(resp.Body).Decode(&searchResp); err == nil && len(searchResp.Hits) > 0 {
 			return &searchResp.Hits[0]
+		}
+		return nil
+	}
+
+	// 1. Try queries with year filter first
+	for _, q := range queries {
+		if hit := doSearch(q, true); hit != nil {
+			return hit
+		}
+	}
+	// 2. If no hit, retry queries without year filter (trackers often differ by ±1-2 years)
+	for _, q := range queries {
+		if hit := doSearch(q, false); hit != nil {
+			return hit
 		}
 	}
 
