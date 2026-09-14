@@ -24,7 +24,7 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
 FROM alpine:latest
 
 WORKDIR /app
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata ffmpeg
 
 COPY --from=builder /app/tracker-proxy /app/tracker-proxy
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/db"
 	"tracker-proxy/pkg/flaresolverr"
+	"tracker-proxy/pkg/home"
 	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
@@ -25,6 +27,7 @@ import (
 	"tracker-proxy/pkg/tracker/nnmclub"
 	"tracker-proxy/pkg/tracker/rutor"
 	"tracker-proxy/pkg/tracker/rutracker"
+	"tracker-proxy/pkg/transcode"
 )
 
 func main() {
@@ -117,10 +120,7 @@ func main() {
 	}
 
 	// Hotlist / Trending Service
-	indexerURL := os.Getenv("IMDB_INDEXER_URL")
-	if indexerURL == "" {
-		indexerURL = "http://imdb-indexer:8090"
-	}
+	indexerURL := resolveIndexerURL()
 	scraper := hotlist.NewScraper(cfg.Trackers.Rutor.BaseURL)
 	matcher := hotlist.NewMatcher(indexerURL)
 	var boltDB *bbolt.DB
@@ -137,14 +137,23 @@ func main() {
 	}
 	log.Printf("SQLite media & playback database opened at %s", cfg.Database.Path)
 
-	playStore := playback.NewStore(mediaDB)
+	playStore := playback.NewStore(mediaDB, indexerURL)
 	nextUpSvc := playback.NewNextUpService(playStore, indexerURL)
-	streamSvc := stream.NewTorrStreamService(cfg.TorrServer.URL, indexerURL, playStore, nextUpSvc)
+	streamSvc := stream.NewTorrStreamService(cfg.TorrServer.URL, indexerURL, playStore, nextUpSvc, agg, cacheStore)
 	log.Printf("TorrServer stream service initialized (url: %s)", cfg.TorrServer.URL)
+
+	// FFmpeg On-the-fly Transcoding Engine
+	transcodeEng := transcode.NewEngine(cfg.TorrServer.URL, "")
+	defer transcodeEng.Close()
+	log.Printf("FFmpeg transcode engine initialized (source: %s)", cfg.TorrServer.URL)
+
+	// Unified Home Feed / Server-Driven UI Aggregator (BFF)
+	homeSvc := home.NewService(playStore, nextUpSvc, hotlistSvc, indexerURL, 60*time.Second)
+	log.Printf("Home BFF service initialized (indexer: %s)", indexerURL)
 
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc)
+	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc, transcodeEng, homeSvc)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)
@@ -191,4 +200,16 @@ func main() {
 	}
 
 	log.Println("Server stopped.")
+}
+
+func resolveIndexerURL() string {
+	if env := os.Getenv("IMDB_INDEXER_URL"); env != "" {
+		return env
+	}
+	conn, err := net.DialTimeout("tcp", "imdb-indexer:8090", 200*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return "http://imdb-indexer:8090"
+	}
+	return "http://127.0.0.1:8090"
 }

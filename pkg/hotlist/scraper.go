@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,80 @@ func (s *Scraper) ScrapeSeries(ctx context.Context, limit int) ([]RawTorrent, er
 	}
 
 	return s.scrapeUrlsConcurrently(ctx, urls, "tv", limit)
+}
+
+// ScrapeFreshMovies fetches latest movie releases sorted by date descending from RuTor
+func (s *Scraper) ScrapeFreshMovies(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	// Categories: 1 = Зарубежные фильмы, 5 = Наши фильмы, 7 = Мультипликация
+	// 5 pages per category, sorted by date (0 = date desc)
+	categories := []int{1, 5, 7}
+	for _, cat := range categories {
+		for page := 0; page < 5; page++ {
+			urls = append(urls, fmt.Sprintf("%s/browse/%d/%d/0/0", s.baseURL, page, cat))
+		}
+	}
+
+	torrents, err := s.scrapeUrlsConcurrently(ctx, urls, "movie", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter strictly for fresh releases: Year >= 2025 to exclude re-seeds of old films
+	minYear := 2025
+	var fresh []RawTorrent
+	for _, t := range torrents {
+		if t.Year >= minYear {
+			fresh = append(fresh, t)
+		}
+	}
+
+	// Sort strictly by PublishDate descending
+	sort.Slice(fresh, func(i, j int) bool {
+		return fresh[i].PublishDate.After(fresh[j].PublishDate)
+	})
+
+	if limit > 0 && len(fresh) > limit {
+		fresh = fresh[:limit]
+	}
+	return fresh, nil
+}
+
+// ScrapeFreshSeries fetches latest TV series sorted by date descending from RuTor
+func (s *Scraper) ScrapeFreshSeries(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	// Categories: 4 = Зарубежные сериалы, 16 = Наши сериалы
+	// 5 pages per category, sorted by date (0 = date desc)
+	categories := []int{4, 16}
+	for _, cat := range categories {
+		for page := 0; page < 5; page++ {
+			urls = append(urls, fmt.Sprintf("%s/browse/%d/%d/0/0", s.baseURL, page, cat))
+		}
+	}
+
+	torrents, err := s.scrapeUrlsConcurrently(ctx, urls, "tv", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Strict filtering for fresh series: Year >= 2025 to exclude re-seeds of old series
+	minYear := 2025
+	var fresh []RawTorrent
+	for _, t := range torrents {
+		if t.Year >= minYear {
+			fresh = append(fresh, t)
+		}
+	}
+
+	// Sort strictly by PublishDate descending
+	sort.Slice(fresh, func(i, j int) bool {
+		return fresh[i].PublishDate.After(fresh[j].PublishDate)
+	})
+
+	if limit > 0 && len(fresh) > limit {
+		fresh = fresh[:limit]
+	}
+	return fresh, nil
 }
 
 // ScrapeAnime fetches top-seeded anime releases from RuTor category 10
@@ -234,6 +309,7 @@ func (s *Scraper) scrapePage(ctx context.Context, pageURL, mediaType string) ([]
 		}
 
 		ru, orig, year, season, quality := ParseReleaseTitle(rawTitle)
+		pubDate := parseRuTorDate(sel.Find("td").First().Text())
 
 		torrents = append(torrents, RawTorrent{
 			Tracker:       "rutor",
@@ -250,7 +326,7 @@ func (s *Scraper) scrapePage(ctx context.Context, pageURL, mediaType string) ([]
 			Leeches:       leeches,
 			Magnet:        magnet,
 			InfoHash:      infoHash,
-			PublishDate:   time.Now(),
+			PublishDate:   pubDate,
 			MediaType:     mediaType,
 		})
 	})
@@ -276,3 +352,48 @@ func parseSizeBytes(valStr, unit string) int64 {
 		return int64(val)
 	}
 }
+
+var ruMonths = map[string]time.Month{
+	"янв": time.January,
+	"фев": time.February,
+	"мар": time.March,
+	"апр": time.April,
+	"май": time.May,
+	"июн": time.June,
+	"июл": time.July,
+	"авг": time.August,
+	"сен": time.September,
+	"окт": time.October,
+	"ноя": time.November,
+	"дек": time.December,
+}
+
+func parseRuTorDate(raw string) time.Time {
+	clean := strings.ReplaceAll(raw, "\u00a0", " ")
+	parts := strings.Fields(clean)
+	if len(parts) >= 3 {
+		day, _ := strconv.Atoi(parts[0])
+		monthKey := strings.ToLower(parts[1])
+		if len(monthKey) > 6 {
+			monthKey = monthKey[:6]
+		}
+		var month time.Month
+		var ok bool
+		for k, v := range ruMonths {
+			if strings.HasPrefix(monthKey, k) {
+				month = v
+				ok = true
+				break
+			}
+		}
+		yr, _ := strconv.Atoi(parts[2])
+		if yr < 100 {
+			yr += 2000
+		}
+		if day > 0 && ok && yr > 2000 {
+			return time.Date(yr, month, day, 12, 0, 0, 0, time.UTC)
+		}
+	}
+	return time.Now()
+}
+

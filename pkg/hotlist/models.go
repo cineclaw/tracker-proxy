@@ -42,9 +42,10 @@ type Item struct {
 	Seeds         int      `json:"seeds"`                  // Total aggregated swarm seeds
 	Leeches       int      `json:"leeches"`                // Total aggregated swarm leeches
 	Tracker       string   `json:"tracker"`                // "rutor", "rutracker", "nnmclub"
-	Quality       string   `json:"quality,omitempty"`      // Best available quality (e.g. "4K UHD | 1080p")
-	Resolution    string   `json:"resolution,omitempty"`   // "4k", "1080p", "lq"
-	TorrentCount  int      `json:"torrent_count"`          // Number of distinct releases merged
+	Quality       string    `json:"quality,omitempty"`      // Best available quality (e.g. "4K UHD | 1080p")
+	Resolution    string    `json:"resolution,omitempty"`   // "4k", "1080p", "lq"
+	TorrentCount  int       `json:"torrent_count"`          // Number of distinct releases merged
+	PublishDate   time.Time `json:"publish_date,omitempty"` // Latest release/torrent creation date
 }
 
 

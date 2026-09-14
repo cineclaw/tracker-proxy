@@ -130,6 +130,11 @@ func (s *Store) Get(rawID string) ([]models.TorrentResult, bool, error) {
 			return nil // expired
 		}
 
+		// Invalidate / ignore legacy or poisoned entries cached without a query
+		if strings.TrimSpace(entry.Query) == "" && len(entry.Results) > 0 {
+			return nil
+		}
+
 		found = true
 		return nil
 	})
@@ -151,10 +156,16 @@ func (s *Store) Set(rawID, query string, results []models.TorrentResult) error {
 		return nil
 	}
 
+	cleanQuery := strings.TrimSpace(query)
+	if cleanQuery == "" && len(results) > 0 {
+		log.Printf("[cache] Refusing to cache %d results for %s: query string is empty", len(results), id)
+		return nil
+	}
+
 	now := time.Now()
 	entry := Entry{
 		IMDbID:       id,
-		Query:        query,
+		Query:        cleanQuery,
 		CreatedAt:    now,
 		ExpiresAt:    now.Add(s.ttl),
 		ResultsCount: len(results),

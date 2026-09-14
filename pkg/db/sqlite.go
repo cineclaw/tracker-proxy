@@ -80,6 +80,24 @@ func (db *DB) migrate() error {
 			value TEXT NOT NULL,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS media_watchlist (
+			imdb_id TEXT PRIMARY KEY,
+			media_type TEXT NOT NULL,
+			title TEXT NOT NULL,
+			original_title TEXT,
+			year INTEGER,
+			rating REAL,
+			poster_path TEXT,
+			backdrop_path TEXT,
+			added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_watchlist_added ON media_watchlist(added_at DESC);`,
+		`CREATE TABLE IF NOT EXISTS media_audio_preferences (
+			imdb_id TEXT PRIMARY KEY,
+			audio_title TEXT NOT NULL,
+			audio_index INTEGER NOT NULL DEFAULT 0,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 
 	for _, q := range queries {

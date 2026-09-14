@@ -91,7 +91,7 @@ func DefaultConfig() *Config {
 		},
 		Cache: CacheConfig{
 			Enabled:  true,
-			Path:     "cache.db",
+			Path:     "data/tracker-proxy/cache/cache.db",
 			TTLHours: 24,
 		},
 		Trackers: TrackersConfig{
@@ -118,7 +118,7 @@ func DefaultConfig() *Config {
 			URL: "http://127.0.0.1:8092",
 		},
 		Database: DatabaseConfig{
-			Path: "cineclaw.db",
+			Path: "data/tracker-proxy/cineclaw.db",
 		},
 	}
 }
@@ -205,6 +205,8 @@ func Load(path string) (*Config, error) {
 		cfg.TorrServer.URL = tsURL
 	}
 	if dbPath := os.Getenv("MEDIA_DB_PATH"); dbPath != "" {
+		cfg.Database.Path = dbPath
+	} else if dbPath := os.Getenv("DATABASE_PATH"); dbPath != "" {
 		cfg.Database.Path = dbPath
 	}
 

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,11 +18,13 @@ import (
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
+	"tracker-proxy/pkg/home"
 	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/models"
 	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
+	"tracker-proxy/pkg/transcode"
 	"tracker-proxy/pkg/version"
 )
 
@@ -33,6 +36,8 @@ type Handler struct {
 	nextUp     *playback.NextUpService
 	auth       *auth.Manager
 	hotlist    *hotlist.Service
+	home       *home.Service
+	transcode  *transcode.TranscodeEngine
 	sf         singleflight.Group
 }
 
@@ -44,6 +49,8 @@ func NewHandler(
 	streamSvc *stream.TorrStreamService,
 	playStore *playback.Store,
 	nextUpSvc *playback.NextUpService,
+	transcodeEng *transcode.TranscodeEngine,
+	homeSvc *home.Service,
 ) *Handler {
 	return &Handler{
 		aggregator: agg,
@@ -53,6 +60,8 @@ func NewHandler(
 		nextUp:     nextUpSvc,
 		auth:       authMgr,
 		hotlist:    hotlistSvc,
+		home:       homeSvc,
+		transcode:  transcodeEng,
 	}
 }
 
@@ -66,6 +75,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/search", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/api/torrents", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/torrents", h.corsMiddleware(h.handleJSONSearch))
+
+	// Home & Hub Unified BFF endpoints
+	mux.HandleFunc("/api/home", h.corsMiddleware(h.handleHomeFeed))
+	mux.HandleFunc("/home", h.corsMiddleware(h.handleHomeFeed))
+	mux.HandleFunc("/api/hub", h.corsMiddleware(h.handleHubFeed))
+	mux.HandleFunc("/hub", h.corsMiddleware(h.handleHubFeed))
 
 	// Tracker hotlist / trending
 	mux.HandleFunc("/api/stream/hotlist", h.corsMiddleware(h.handleHotlist))
@@ -92,14 +107,28 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stream/player/stop", h.corsMiddleware(h.handlePlayerStop))
 	mux.HandleFunc("/api/stream/resume", h.corsMiddleware(h.handleStreamResume))
 	mux.HandleFunc("/stream/resume", h.corsMiddleware(h.handleStreamResume))
+	mux.HandleFunc("/api/stream/resume/remove", h.corsMiddleware(h.handleStreamResume))
+	mux.HandleFunc("/stream/resume/remove", h.corsMiddleware(h.handleStreamResume))
+
+	// On-the-fly video transcoding endpoints (FFmpeg)
+	mux.HandleFunc("/api/stream/transcode/profiles", h.corsMiddleware(h.handleTranscodeProfiles))
+	mux.HandleFunc("/api/stream/transcode/stop", h.corsMiddleware(h.handleTranscodeStop))
+	mux.HandleFunc("/api/stream/transcode/seg/", h.corsMiddleware(h.handleTranscodeSegment))
+	mux.HandleFunc("/api/stream/transcode/", h.corsMiddleware(h.handleTranscodePlaylist))
 
 	// Native Playback & Watch History (SQLite)
 	mux.HandleFunc("/api/playback/progress", h.corsMiddleware(h.handlePlaybackProgress))
+	mux.HandleFunc("/api/playback/audio", h.corsMiddleware(h.handlePlaybackAudioPreference))
 	mux.HandleFunc("/api/playback/resume", h.corsMiddleware(h.handlePlaybackResume))
 	mux.HandleFunc("/api/playback/next-up", h.corsMiddleware(h.handlePlaybackNextUp))
 	mux.HandleFunc("/api/playback/item", h.corsMiddleware(h.handlePlaybackItem))
 	mux.HandleFunc("/api/playback/series-progress", h.corsMiddleware(h.handlePlaybackSeriesProgress))
+	mux.HandleFunc("/api/playback/mark-watched", h.corsMiddleware(h.handlePlaybackMarkWatched))
 	mux.HandleFunc("/api/playback/delete", h.corsMiddleware(h.handlePlaybackDelete))
+	mux.HandleFunc("/api/watchlist", h.corsMiddleware(h.handleWatchlist))
+	mux.HandleFunc("/api/watchlist/check", h.corsMiddleware(h.handleWatchlistCheck))
+	mux.HandleFunc("/api/playback/watchlist", h.corsMiddleware(h.handleWatchlist))
+	mux.HandleFunc("/api/playback/watchlist/check", h.corsMiddleware(h.handleWatchlistCheck))
 
 	// Jellyfin webhook endpoints (no-op backwards compatibility)
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
@@ -341,6 +370,26 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 	normIMDb := cache.NormalizeIMDbID(imdbID)
 	cacheStatus := "BYPASS"
 
+	var meta *stream.IndexerMeta
+	if normIMDb != "" && h.mounter != nil {
+		meta = h.mounter.FetchIndexerMeta(ctx, normIMDb)
+	}
+
+	// Auto-resolve title from IMDb indexer if queryStr is empty
+	if strings.TrimSpace(queryStr) == "" && meta != nil {
+		baseTitle := strings.TrimSpace(meta.Title)
+		if baseTitle == "" {
+			baseTitle = strings.TrimSpace(meta.OriginalTitle)
+		}
+		if baseTitle != "" {
+			if meta.Year > 0 && (mediaType == "movie" || mediaType == "") {
+				queryStr = fmt.Sprintf("%s %d", baseTitle, meta.Year)
+			} else {
+				queryStr = baseTitle
+			}
+		}
+	}
+
 	if normIMDb != "" && h.cache != nil && !refreshCache {
 		if cached, found, err := h.cache.Get(normIMDb); err == nil && found {
 			for i := range cached {
@@ -371,6 +420,11 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 				}
 			}
 			filtered := filterAndRankBySeason(cached, season)
+			if meta != nil {
+				sort.SliceStable(filtered, func(i, j int) bool {
+					return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
+				})
+			}
 			if limit > 0 && len(filtered) > limit {
 				filtered = filtered[:limit]
 			}
@@ -379,6 +433,11 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 	}
 
 	if normIMDb != "" {
+		if strings.TrimSpace(queryStr) == "" {
+			log.Printf("[search] Cannot search trackers for %s: title query could not be resolved", normIMDb)
+			return nil, "EMPTY"
+		}
+
 		if refreshCache {
 			cacheStatus = "REFRESHED"
 		} else {
@@ -393,6 +452,15 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 				RefreshCache: refreshCache,
 				Limit:        limit,
 			})
+			if len(res) == 0 && meta != nil && strings.TrimSpace(meta.Title) != "" && queryStr != strings.TrimSpace(meta.Title) {
+				res = h.aggregator.Search(ctx, models.SearchQuery{
+					Query:        strings.TrimSpace(meta.Title),
+					Type:         mediaType,
+					IMDbID:       normIMDb,
+					RefreshCache: refreshCache,
+					Limit:        limit,
+				})
+			}
 			if h.cache != nil && len(res) > 0 {
 				_ = h.cache.Set(normIMDb, queryStr, res)
 			}
@@ -401,11 +469,20 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 		if err == nil && v != nil {
 			results := v.([]models.TorrentResult)
 			filtered := filterAndRankBySeason(results, season)
+			if meta != nil {
+				sort.SliceStable(filtered, func(i, j int) bool {
+					return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
+				})
+			}
 			if limit > 0 && len(filtered) > limit {
 				filtered = filtered[:limit]
 			}
 			return filtered, cacheStatus
 		}
+	}
+
+	if strings.TrimSpace(queryStr) == "" {
+		return nil, "EMPTY"
 	}
 
 	results := h.aggregator.Search(ctx, models.SearchQuery{
@@ -414,6 +491,11 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 		Limit: limit,
 	})
 	filtered := filterAndRankBySeason(results, season)
+	if meta != nil {
+		sort.SliceStable(filtered, func(i, j int) bool {
+			return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
+		})
+	}
 	if limit > 0 && len(filtered) > limit {
 		filtered = filtered[:limit]
 	}
@@ -466,6 +548,9 @@ func (h *Handler) handleJSONSearch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Cache", cacheStatus)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
+	if results == nil {
+		results = []models.TorrentResult{}
+	}
 	_ = json.NewEncoder(w).Encode(results)
 }
 
@@ -719,6 +804,10 @@ func (h *Handler) handlePlayerProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.home != nil {
+		h.home.InvalidateWatchState()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }
@@ -735,6 +824,10 @@ func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.transcode != nil && req.MediaSourceId != "" {
+		h.transcode.StopSessionsForHash(req.MediaSourceId)
+	}
+
 	res, err := h.mounter.ReportPlaybackStop(r.Context(), &req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -746,6 +839,10 @@ func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.home != nil {
+		h.home.InvalidateWatchState()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }
@@ -753,6 +850,52 @@ func (h *Handler) handlePlayerStop(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleStreamResume(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+
+	if r.Method == http.MethodDelete || (r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/remove")) {
+		var req stream.DeleteResumeRequest
+		if r.Header.Get("Content-Type") == "application/json" {
+			_ = json.NewDecoder(r.Body).Decode(&req)
+		}
+		if req.ItemId == "" {
+			req.ItemId = r.URL.Query().Get("item_id")
+		}
+		if req.Tconst == "" {
+			req.Tconst = r.URL.Query().Get("tconst")
+		}
+		if req.Season == 0 {
+			req.Season, _ = strconv.Atoi(r.URL.Query().Get("season"))
+		}
+		if req.Episode == 0 {
+			req.Episode, _ = strconv.Atoi(r.URL.Query().Get("episode"))
+		}
+		if !req.IsNextUp {
+			req.IsNextUp = r.URL.Query().Get("is_next_up") == "true"
+		}
+		if !req.All {
+			req.All = r.URL.Query().Get("all") == "true"
+		}
+
+		if err := h.mounter.DeleteResumeItem(ctx, &req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+
+		if h.home != nil {
+			h.home.InvalidateWatchState()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Успешно удалено из списка продолжения просмотра",
+		})
+		return
+	}
 
 	items, err := h.mounter.GetResumeItems(ctx)
 	if err != nil {
@@ -851,6 +994,60 @@ func (h *Handler) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) handleHomeFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.home == nil {
+		http.Error(w, "Home service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	platform := r.URL.Query().Get("platform")
+	forceRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh_cache") == "true"
+
+	payload, err := h.home.GetHomeFeed(r.Context(), platform, forceRefresh)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (h *Handler) handleHubFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.home == nil {
+		http.Error(w, "Home service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	platform := r.URL.Query().Get("platform")
+	forceRefresh := r.URL.Query().Get("refresh") == "true"
+
+	payload, err := h.home.GetHomeFeed(r.Context(), platform, forceRefresh)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
 func (h *Handler) handleHotlist(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -895,11 +1092,54 @@ func (h *Handler) handlePlaybackProgress(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("[playback] SaveProgress: imdb_id=%s, type=%s, s=%d, e=%d, pos=%.1fs, dur=%.1fs, pct=%.1f%%, completed=%v",
+		item.ImdbID, item.MediaType, item.SeasonNumber, item.EpisodeNumber, item.PositionSeconds, item.DurationSeconds, item.PlaybackPercent, item.IsCompleted)
 	if h.playback != nil {
 		if err := h.playback.SaveProgress(&item); err != nil {
+			log.Printf("[playback] SaveProgress ERROR: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if h.home != nil {
+			h.home.InvalidateWatchState()
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+type AudioPreferenceRequest struct {
+	ImdbID     string `json:"imdb_id"`
+	AudioTitle string `json:"audio_title"`
+	AudioIndex int    `json:"audio_index"`
+}
+
+func (h *Handler) handlePlaybackAudioPreference(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req AudioPreferenceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("[audio_pref] Received preference request: imdb_id=%s, audio_title=%q, audio_index=%d", req.ImdbID, req.AudioTitle, req.AudioIndex)
+	if req.ImdbID == "" {
+		http.Error(w, "imdb_id is required", http.StatusBadRequest)
+		return
+	}
+	if h.playback != nil {
+		if err := h.playback.SaveAudioPreference(req.ImdbID, req.AudioTitle, req.AudioIndex); err != nil {
+			log.Printf("[audio_pref] Failed to save preference: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("[audio_pref] Saved preference for %s: %s (index %d)", req.ImdbID, req.AudioTitle, req.AudioIndex)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -979,6 +1219,21 @@ func (h *Handler) handlePlaybackItem(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(item)
 }
 
+type MarkWatchedRequest struct {
+	ImdbID       string `json:"imdb_id"`
+	Mode         string `json:"mode"` // "episode", "season", "up_to", "series"
+	Title        string `json:"title,omitempty"`
+	PosterPath   string `json:"poster_path,omitempty"`
+	BackdropPath string `json:"backdrop_path,omitempty"`
+	Season       int    `json:"season,omitempty"`
+	Episode      int    `json:"episode,omitempty"`
+	EpisodeTitle string `json:"episode_title,omitempty"`
+	EpisodeStill string `json:"episode_still,omitempty"`
+	UpToSeason   int    `json:"up_to_season,omitempty"`
+	UpToEpisode  int    `json:"up_to_episode,omitempty"`
+	Completed    bool   `json:"completed"`
+}
+
 func (h *Handler) handlePlaybackSeriesProgress(w http.ResponseWriter, r *http.Request) {
 	imdbId := r.URL.Query().Get("imdb_id")
 	if imdbId == "" {
@@ -986,20 +1241,87 @@ func (h *Handler) handlePlaybackSeriesProgress(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var res map[string]playback.EpisodeProgressStatus
-	var err error
-	if h.playback != nil {
-		res, err = h.playback.GetSeriesProgress(imdbId)
+	var allEps []playback.TmdbEpisodeItem
+	if h.nextUp != nil {
+		allEps, _ = h.nextUp.FetchSeriesEpisodes(imdbId)
 	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+	if h.playback != nil {
+		summary, err := h.playback.GetSeriesDetailedProgress(imdbId, allEps)
+		if err == nil && summary != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(summary)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"imdb_id":        imdbId,
+		"total_episodes": 0,
+		"total_watched":  0,
+		"is_completed":   false,
+		"seasons":        map[string]interface{}{},
+		"episodes":       map[string]interface{}{},
+	})
+}
+
+func (h *Handler) handlePlaybackMarkWatched(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if res == nil {
-		res = make(map[string]playback.EpisodeProgressStatus)
+
+	var req MarkWatchedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
 	}
+
+	if req.ImdbID == "" {
+		http.Error(w, "imdb_id required", http.StatusBadRequest)
+		return
+	}
+
+	if h.playback == nil {
+		http.Error(w, "Playback store not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	var allEps []playback.TmdbEpisodeItem
+	if h.nextUp != nil {
+		allEps, _ = h.nextUp.FetchSeriesEpisodes(req.ImdbID)
+	}
+
+	var err error
+	switch req.Mode {
+	case "season":
+		err = h.playback.MarkSeasonWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, allEps, req.Completed)
+	case "up_to":
+		err = h.playback.MarkAllUpToEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.UpToSeason, req.UpToEpisode, allEps)
+	case "series":
+		err = h.playback.MarkSeriesWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, allEps, req.Completed)
+	default: // "episode"
+		err = h.playback.MarkEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, req.Episode, req.EpisodeTitle, req.EpisodeStill, req.Completed)
+	}
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	if h.home != nil {
+		h.home.InvalidateWatchState()
+	}
+
+	summary, _ := h.playback.GetSeriesDetailedProgress(req.ImdbID, allEps)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(res)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"progress": summary,
+	})
 }
 
 func (h *Handler) handlePlaybackDelete(w http.ResponseWriter, r *http.Request) {
@@ -1013,8 +1335,263 @@ func (h *Handler) handlePlaybackDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.playback != nil {
-		_ = h.playback.DeleteItemProgress(imdbId, season, episode)
+		if season == 0 && episode == 0 {
+			_ = h.playback.DeleteShowProgress(imdbId)
+		} else {
+			_ = h.playback.DeleteItemProgress(imdbId, season, episode)
+		}
+		if h.home != nil {
+			h.home.InvalidateWatchState()
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
+
+func (h *Handler) handleWatchlist(w http.ResponseWriter, r *http.Request) {
+	if h.playback == nil {
+		http.Error(w, "Playback store not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		items, err := h.playback.GetWatchlist(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if items == nil {
+			items = []playback.WatchlistItem{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(items)
+
+	case http.MethodPost:
+		var item playback.WatchlistItem
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if err := h.playback.AddToWatchlist(r.Context(), item); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if h.home != nil {
+			h.home.InvalidateWatchState()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+
+	case http.MethodDelete:
+		imdbID := r.URL.Query().Get("imdb_id")
+		if imdbID == "" {
+			var body struct {
+				ImdbID string `json:"imdb_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				imdbID = body.ImdbID
+			}
+		}
+		if imdbID == "" {
+			http.Error(w, "imdb_id required", http.StatusBadRequest)
+			return
+		}
+		if err := h.playback.RemoveFromWatchlist(r.Context(), imdbID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if h.home != nil {
+			h.home.InvalidateWatchState()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleWatchlistCheck(w http.ResponseWriter, r *http.Request) {
+	if h.playback == nil {
+		http.Error(w, "Playback store not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	imdbID := r.URL.Query().Get("imdb_id")
+	if imdbID == "" {
+		http.Error(w, "imdb_id required", http.StatusBadRequest)
+		return
+	}
+
+	inList, err := h.playback.IsInWatchlist(r.Context(), imdbID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"in_watchlist": inList})
+}
+
+// Transcode Handlers
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (h *Handler) handleTranscodeProfiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(transcode.AvailableProfiles())
+}
+
+func (h *Handler) handleTranscodeStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := r.URL.Query().Get("session")
+	hash := r.URL.Query().Get("hash")
+
+	if r.Header.Get("Content-Type") == "application/json" {
+		var req struct {
+			Session string `json:"session"`
+			Hash    string `json:"hash"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			if req.Session != "" {
+				sessionID = req.Session
+			}
+			if req.Hash != "" {
+				hash = req.Hash
+			}
+		}
+	}
+
+	if h.transcode != nil {
+		if sessionID != "" {
+			h.transcode.StopSession(sessionID)
+		}
+		if hash != "" {
+			h.transcode.StopSessionsForHash(hash)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) handleTranscodeSegment(w http.ResponseWriter, r *http.Request) {
+	if h.transcode == nil {
+		http.Error(w, "Transcode engine unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Path: /api/stream/transcode/seg/{sessionID}/{filename}
+	path := strings.TrimPrefix(r.URL.Path, "/api/stream/transcode/seg/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	sessionID := parts[0]
+	filename := parts[1]
+
+	sess := h.transcode.GetSession(sessionID)
+	if sess == nil {
+		http.Error(w, "Transcode session not found or expired", http.StatusNotFound)
+		return
+	}
+
+	data, err := sess.GetSegment(filename)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/MP2T")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (h *Handler) handleTranscodePlaylist(w http.ResponseWriter, r *http.Request) {
+	if h.transcode == nil {
+		http.Error(w, "Transcode engine unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Path: /api/stream/transcode/{hash}/master.m3u8 or /api/stream/transcode/{hash}/live.m3u8
+	path := strings.TrimPrefix(r.URL.Path, "/api/stream/transcode/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	hash := parts[0]
+	profileID := r.URL.Query().Get("profile")
+	profile := transcode.GetProfile(profileID)
+
+	fileIdx := 0
+	if idxStr := firstNonEmpty(r.URL.Query().Get("file_idx"), r.URL.Query().Get("index"), r.URL.Query().Get("id")); idxStr != "" {
+		if n, err := strconv.Atoi(idxStr); err == nil {
+			fileIdx = n
+		}
+	}
+
+	audioIdx := 0
+	if aStr := r.URL.Query().Get("audio"); aStr != "" {
+		if n, err := strconv.Atoi(aStr); err == nil {
+			audioIdx = n
+		}
+	}
+
+	startSec := 0.0
+	if sStr := r.URL.Query().Get("start"); sStr != "" {
+		if f, err := strconv.ParseFloat(sStr, 64); err == nil {
+			startSec = f
+		}
+	}
+
+	customID := r.URL.Query().Get("s")
+
+	durationSec := 0.0
+	if dStr := r.URL.Query().Get("duration"); dStr != "" {
+		if f, err := strconv.ParseFloat(dStr, 64); err == nil && f > 0 {
+			durationSec = f
+		}
+	}
+	if durationSec <= 0 && h.mounter != nil {
+		durationSec = h.mounter.GetStreamDuration(r.Context(), hash, fileIdx)
+	}
+	if durationSec <= 0 {
+		durationSec = 7200.0 // 2 hours default fallback
+	}
+
+	sess, err := h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, durationSec, customID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Transcode failed: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	vodPlaylist := transcode.GenerateVODPlaylist(sess.ID, durationSec, startSec)
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(vodPlaylist))
+}
+
+

@@ -57,6 +57,8 @@ func NewService(scraper *Scraper, matcher *Matcher, db *bbolt.DB, ttl time.Durat
 	// Load initial data from bbolt if available
 	s.loadFromDB("movie")
 	s.loadFromDB("tv")
+	s.loadFromDB("new_movie")
+	s.loadFromDB("new_tv")
 	s.loadFromDB("anime")
 	s.loadFromDB("doc")
 
@@ -74,6 +76,14 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType, quality string, pag
 	switch strings.ToLower(mediaType) {
 	case "tv":
 		validType = "tv"
+	case "new_movie", "fresh_movie", "new":
+		validType = "new_movie"
+		shelfID = "tracker_fresh"
+		shelfTitle = "Новинки кино на трекерах"
+	case "new_tv", "fresh_tv":
+		validType = "new_tv"
+		shelfID = "tracker_fresh"
+		shelfTitle = "Новинки сериалов на трекерах"
 	case "anime":
 		validType = "anime"
 		shelfID = "anime_hub"
@@ -94,6 +104,16 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType, quality string, pag
 	}
 
 	items := s.getItems(ctx, validType, forceRefresh)
+
+	// Filter out items with low rating (< 6.0) if rating is known
+	var cleanItems []Item
+	for _, it := range items {
+		if it.Rating > 0 && it.Rating < 6.0 {
+			continue
+		}
+		cleanItems = append(cleanItems, it)
+	}
+	items = cleanItems
 
 	is4K := strings.EqualFold(quality, "4k") || strings.EqualFold(quality, "uhd")
 	if is4K {
@@ -151,7 +171,25 @@ func (s *Service) getItems(ctx context.Context, mediaType string, forceRefresh b
 	cached, found := s.memCache[mediaType]
 	s.mu.RUnlock()
 
-	if forceRefresh {
+	// Check if cached items are corrupt (all lack tconst and poster) or contain legacy /poster/ paths
+	isCorrupt := false
+	if found && len(cached.Items) > 0 {
+		hasValid := false
+		for _, it := range cached.Items {
+			if strings.HasPrefix(it.PosterPath, "/poster/") {
+				isCorrupt = true
+				break
+			}
+			if it.Tconst != "" || it.PosterPath != "" {
+				hasValid = true
+			}
+		}
+		if !hasValid {
+			isCorrupt = true
+		}
+	}
+
+	if forceRefresh || isCorrupt {
 		s.fetchAndSave(ctx, mediaType)
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -208,6 +246,12 @@ func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
 	switch mediaType {
 	case "tv":
 		raw, err = s.scraper.ScrapeSeries(ctx, 0)
+	case "new_movie":
+		raw, err = s.scraper.ScrapeFreshMovies(ctx, 0)
+		matchingMediaType = "new_movie"
+	case "new_tv":
+		raw, err = s.scraper.ScrapeFreshSeries(ctx, 0)
+		matchingMediaType = "new_tv"
 	case "anime":
 		raw, err = s.scraper.ScrapeAnime(ctx, 0)
 		matchingMediaType = "tv"
@@ -277,6 +321,27 @@ func (s *Service) loadFromDB(mediaType string) {
 		}
 		var data CachedData
 		if err := json.Unmarshal(val, &data); err == nil {
+			// Validate that restored items have valid matches and do not contain legacy /poster/ endpoints
+			hasValid := false
+			hasLegacy := false
+			for _, it := range data.Items {
+				if strings.HasPrefix(it.PosterPath, "/poster/") {
+					hasLegacy = true
+					break
+				}
+				if it.Tconst != "" || it.PosterPath != "" {
+					hasValid = true
+				}
+			}
+			if hasLegacy {
+				log.Printf("[hotlist] Discarding legacy /poster/ cached %s hotlist items from bbolt", mediaType)
+				return nil
+			}
+			if len(data.Items) > 0 && !hasValid {
+				log.Printf("[hotlist] Discarding corrupt cached %s hotlist items from bbolt (no tconst or poster matched)", mediaType)
+				return nil
+			}
+
 			s.mu.Lock()
 			s.memCache[mediaType] = data
 			s.mu.Unlock()
@@ -291,10 +356,12 @@ func (s *Service) backgroundRefresher() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		log.Printf("[hotlist] Periodic background refresh triggered for movie, tv, anime, doc...")
+		log.Printf("[hotlist] Periodic background refresh triggered for movie, tv, new_movie, new_tv, anime, doc...")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		s.fetchAndSave(ctx, "movie")
 		s.fetchAndSave(ctx, "tv")
+		s.fetchAndSave(ctx, "new_movie")
+		s.fetchAndSave(ctx, "new_tv")
 		s.fetchAndSave(ctx, "anime")
 		s.fetchAndSave(ctx, "doc")
 		cancel()

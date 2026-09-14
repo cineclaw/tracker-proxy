@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,8 +26,10 @@ type IndexerHit struct {
 		Genres         []string `json:"genres"`
 		RuntimeMinutes *int     `json:"runtime_minutes"`
 	} `json:"movie"`
-	PosterURL string `json:"poster_url"`
-	Posters   struct {
+	PosterPath   *string `json:"poster_path"`
+	BackdropPath *string `json:"backdrop_path"`
+	PosterURL    string  `json:"poster_url"`
+	Posters      struct {
 		Thumbnail string `json:"thumbnail"`
 		Small     string `json:"small"`
 		Medium    string `json:"medium"`
@@ -60,23 +63,49 @@ func NewMatcher(indexerURL string) *Matcher {
 
 // MatchAndGroup matches raw torrents to IMDb metadata and aggregates duplicates
 func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, mediaType string) []Item {
-	type key struct {
-		id string
+	// First gather unique torrent items needing lookup
+	uniqueTorrents := make(map[string]RawTorrent)
+	for _, t := range torrents {
+		cacheKey := fmt.Sprintf("%s:%s:%s:%d", mediaType, t.OriginalTitle, t.RussianTitle, t.Year)
+		if _, exists := uniqueTorrents[cacheKey]; !exists {
+			uniqueTorrents[cacheKey] = t
+		}
 	}
+
+	// Concurrently resolve IMDb metadata with 16 workers
+	lookupCache := make(map[string]*IndexerHit)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
+
+	for k, t := range uniqueTorrents {
+		wg.Add(1)
+		go func(key string, item RawTorrent) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+
+			hit := m.lookup(ctx, item, mediaType)
+			if hit != nil {
+				mu.Lock()
+				lookupCache[key] = hit
+				mu.Unlock()
+			}
+		}(k, t)
+	}
+	wg.Wait()
 
 	// Map tconst (or fallback key) -> Aggregated Item
 	grouped := make(map[string]*Item)
-	lookupCache := make(map[string]*IndexerHit)
 	var order []string
 
-	for i, t := range torrents {
-		// Attempt match against Tantivy indexer (with in-run cache)
+	for _, t := range torrents {
 		cacheKey := fmt.Sprintf("%s:%s:%s:%d", mediaType, t.OriginalTitle, t.RussianTitle, t.Year)
-		hit, cached := lookupCache[cacheKey]
-		if !cached {
-			hit = m.lookup(ctx, t, mediaType)
-			lookupCache[cacheKey] = hit
-		}
+		hit := lookupCache[cacheKey]
 
 		groupKey := ""
 		displayTitle := t.RussianTitle
@@ -85,6 +114,7 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 		rating := 0.0
 		voteCount := 0
 		posterPath := ""
+		backdropPath := ""
 		genres := []string{}
 		tconst := ""
 
@@ -104,9 +134,17 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 				rating = *hit.Movie.Rating
 			}
 			voteCount = hit.Movie.NumVotes
-			posterPath = hit.Posters.Large
-			if posterPath == "" {
+			if hit.PosterPath != nil && *hit.PosterPath != "" {
+				posterPath = *hit.PosterPath
+			} else if hit.Posters.Large != "" && !strings.HasPrefix(hit.Posters.Large, "/poster/") {
+				posterPath = hit.Posters.Large
+			} else if hit.PosterURL != "" && !strings.HasPrefix(hit.PosterURL, "/poster/") {
 				posterPath = hit.PosterURL
+			}
+			if hit.BackdropPath != nil && *hit.BackdropPath != "" {
+				backdropPath = *hit.BackdropPath
+			} else {
+				backdropPath = posterPath
 			}
 			genres = hit.Movie.Genres
 		} else {
@@ -121,38 +159,37 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 			existing.Seeds += t.Seeds
 			existing.Leeches += t.Leeches
 			existing.TorrentCount++
+			if t.PublishDate.After(existing.PublishDate) {
+				existing.PublishDate = t.PublishDate
+			}
 			if shouldUpgradeQuality(existing.Quality, t.Quality) {
 				existing.Quality = t.Quality
-			}
-			newRes := determineResolution(t.Quality)
-			if newRes == "4k" || existing.Resolution == "" {
-				existing.Resolution = determineResolution(existing.Quality)
+				existing.Resolution = determineResolution(t.Quality)
 			}
 		} else {
-			id := i + 1
 			item := &Item{
-				ID:            id,
 				Tconst:        tconst,
-				MediaType:     mediaType,
 				Title:         displayTitle,
 				OriginalTitle: originalTitle,
 				Year:          year,
 				Rating:        rating,
 				VoteCount:     voteCount,
 				PosterPath:    posterPath,
+				BackdropPath:  backdropPath,
 				Genres:        genres,
+				MediaType:     mediaType,
 				Seeds:         t.Seeds,
 				Leeches:       t.Leeches,
 				Tracker:       t.Tracker,
 				Quality:       t.Quality,
 				Resolution:    determineResolution(t.Quality),
 				TorrentCount:  1,
+				PublishDate:   t.PublishDate,
 			}
 			grouped[groupKey] = item
 			order = append(order, groupKey)
 		}
 	}
-
 
 	// Collect items
 	result := make([]Item, 0, len(grouped))
@@ -160,10 +197,16 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 		result = append(result, *grouped[k])
 	}
 
-	// Sort by total seeds descending
-	sort.SliceStable(result, func(i, j int) bool {
-		return result[i].Seeds > result[j].Seeds
-	})
+	// For fresh/new categories, sort strictly by PublishDate descending; otherwise by seeds
+	if strings.HasPrefix(mediaType, "new") || strings.HasPrefix(mediaType, "fresh") {
+		sort.SliceStable(result, func(i, j int) bool {
+			return result[i].PublishDate.After(result[j].PublishDate)
+		})
+	} else {
+		sort.SliceStable(result, func(i, j int) bool {
+			return result[i].Seeds > result[j].Seeds
+		})
+	}
 
 	// Reassign IDs 1..N for stable frontend rendering
 	for i := range result {
@@ -184,48 +227,41 @@ func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *I
 	}
 
 	titleType := "movie"
-	if mediaType == "tv" {
+	if mediaType == "tv" || mediaType == "new_tv" {
 		titleType = "tvSeries"
 	}
 
-	candidateHosts := []string{m.indexerURL}
-	if !strings.Contains(m.indexerURL, "host.docker.internal") {
-		candidateHosts = append(candidateHosts, "http://host.docker.internal:8090")
-	}
+	for _, q := range queries {
+		u, err := url.Parse(fmt.Sprintf("%s/search", strings.TrimRight(m.indexerURL, "/")))
+		if err != nil {
+			continue
+		}
+		params := url.Values{}
+		params.Set("q", q)
+		params.Set("type", titleType)
+		params.Set("limit", "2")
+		if t.Year > 1900 {
+			params.Set("year_from", fmt.Sprintf("%d", t.Year-1))
+			params.Set("year_to", fmt.Sprintf("%d", t.Year+1))
+		}
+		u.RawQuery = params.Encode()
 
-	for _, host := range candidateHosts {
-		for _, q := range queries {
-			u, err := url.Parse(fmt.Sprintf("%s/search", strings.TrimRight(host, "/")))
-			if err != nil {
-				continue
-			}
-			params := url.Values{}
-			params.Set("q", q)
-			params.Set("type", titleType)
-			params.Set("limit", "2")
-			if t.Year > 1900 {
-				params.Set("year_from", fmt.Sprintf("%d", t.Year-1))
-				params.Set("year_to", fmt.Sprintf("%d", t.Year+1))
-			}
-			u.RawQuery = params.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			continue
+		}
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-			if err != nil {
-				continue
-			}
+		resp, err := m.client.Do(req)
+		if err != nil {
+			continue
+		}
 
-			resp, err := m.client.Do(req)
-			if err != nil {
-				continue
-			}
+		var searchResp IndexerSearchResponse
+		err = json.NewDecoder(resp.Body).Decode(&searchResp)
+		resp.Body.Close()
 
-			var searchResp IndexerSearchResponse
-			err = json.NewDecoder(resp.Body).Decode(&searchResp)
-			resp.Body.Close()
-
-			if err == nil && len(searchResp.Hits) > 0 {
-				return &searchResp.Hits[0]
-			}
+		if err == nil && len(searchResp.Hits) > 0 {
+			return &searchResp.Hits[0]
 		}
 	}
 

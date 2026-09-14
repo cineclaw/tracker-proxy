@@ -44,6 +44,11 @@ func (a *Aggregator) SetCache(cs *cache.Store) {
 }
 
 func (a *Aggregator) Search(ctx context.Context, query models.SearchQuery) []models.TorrentResult {
+	if strings.TrimSpace(query.Query) == "" {
+		log.Printf("[aggregator] Search called with empty query for imdb=%q; aborting search to prevent tracker homepage dumps", query.IMDbID)
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
