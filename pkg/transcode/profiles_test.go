@@ -71,6 +71,33 @@ func TestBuildFFmpegArgs(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsDirectRemux(t *testing.T) {
+	profile := GetProfile("direct")
+	args := BuildFFmpegArgs(
+		"http://localhost:8092/torr/stream/video.mkv?link=abc&index=1&play",
+		0,
+		0,
+		0,
+		profile,
+		"/tmp/out/index.m3u8",
+		"/tmp/out/seg_%04d.ts",
+	)
+
+	cmdStr := strings.Join(args, " ")
+	if !strings.Contains(cmdStr, "-c:v copy") {
+		t.Errorf("expected -c:v copy for direct remux profile, got: %s", cmdStr)
+	}
+	if strings.Contains(cmdStr, "libx264") || strings.Contains(cmdStr, "scale=") {
+		t.Errorf("direct remux profile must not re-encode video: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-c:a aac") {
+		t.Errorf("expected -c:a aac, got: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-b:a 256k") {
+		t.Errorf("expected -b:a 256k, got: %s", cmdStr)
+	}
+}
+
 func TestGenerateVODPlaylist(t *testing.T) {
 	pl := GenerateVODPlaylist("test_sess", 10.0, 3.0)
 	if !strings.Contains(pl, "#EXT-X-PLAYLIST-TYPE:VOD") {

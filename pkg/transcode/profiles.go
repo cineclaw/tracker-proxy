@@ -161,32 +161,44 @@ func BuildFFmpegArgs(
 		args = append(args, "-output_ts_offset", fmt.Sprintf("%.3f", startSeconds))
 	}
 
-	// Video scaling and encoding:
-	// - Closed GOP (+cgop) eliminates any cross-segment reference decoding glitches.
-	// - Force keyframes at exact 3-second boundaries (75 frames at 25fps).
-	// - Veryfast preset with zerolatency tuning for instant initial frame delivery.
-	scaleFilter := fmt.Sprintf("scale=w=-2:h=min(%d\\,ih)", profile.MaxHeight)
-	args = append(args,
-		"-c:v", "libx264",
-		"-preset", "superfast",
-		"-tune", "zerolatency",
-		"-profile:v", "main",
-		"-level", "4.1",
-		"-pix_fmt", "yuv420p",
-		"-flags", "+cgop",
-		"-g", "75",
-		"-keyint_min", "75",
-		"-force_key_frames", "expr:gte(t,n_forced*3)",
-		"-vf", scaleFilter,
-		"-b:v", fmt.Sprintf("%dk", profile.BitrateKbps),
-		"-maxrate", fmt.Sprintf("%dk", profile.MaxRateKbps),
-		"-bufsize", fmt.Sprintf("%dk", profile.BufSizeKbps),
-	)
+	if profile.ID == "direct" || (profile.IsDirect && profile.ID != "http_direct") {
+		// Pure zero-transcode video remux: copy original video bitstream without re-encoding
+		args = append(args,
+			"-c:v", "copy",
+		)
+	} else {
+		// Video scaling and encoding:
+		// - Closed GOP (+cgop) eliminates any cross-segment reference decoding glitches.
+		// - Force keyframes at exact 3-second boundaries (75 frames at 25fps).
+		// - Veryfast preset with zerolatency tuning for instant initial frame delivery.
+		scaleFilter := fmt.Sprintf("scale=w=-2:h=min(%d\\,ih)", profile.MaxHeight)
+		args = append(args,
+			"-c:v", "libx264",
+			"-preset", "superfast",
+			"-tune", "zerolatency",
+			"-profile:v", "main",
+			"-level", "4.1",
+			"-pix_fmt", "yuv420p",
+			"-flags", "+cgop",
+			"-g", "75",
+			"-keyint_min", "75",
+			"-force_key_frames", "expr:gte(t,n_forced*3)",
+			"-vf", scaleFilter,
+			"-b:v", fmt.Sprintf("%dk", profile.BitrateKbps),
+			"-maxrate", fmt.Sprintf("%dk", profile.MaxRateKbps),
+			"-bufsize", fmt.Sprintf("%dk", profile.BufSizeKbps),
+		)
+	}
+
+	audioBitrate := profile.AudioKbps
+	if audioBitrate <= 0 {
+		audioBitrate = 256
+	}
 
 	// Audio encoding: stereo downmix with AAC and sample-accurate timestamp sync (no clicks/pops)
 	args = append(args,
 		"-c:a", "aac",
-		"-b:a", fmt.Sprintf("%dk", profile.AudioKbps),
+		"-b:a", fmt.Sprintf("%dk", audioBitrate),
 		"-ac", "2",
 		"-af", "aresample=async=1000",
 	)
