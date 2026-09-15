@@ -525,17 +525,19 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 			}
 
 			if h.cache != nil && len(res) > 0 {
-				// Merge with existing cached items if any
-				if existing, found, err := h.cache.Get(normIMDb); err == nil && found && len(existing) > 0 {
-					existingIDs := make(map[string]bool)
-					for _, r := range res {
-						existingIDs[r.ID+"_"+r.Tracker] = true
-					}
-					for _, er := range existing {
-						key := er.ID + "_" + er.Tracker
-						if !existingIDs[key] {
-							existingIDs[key] = true
-							res = append(res, er)
+				// Merge with existing cached items only if not doing a forced cache refresh
+				if !refreshCache {
+					if existing, found, err := h.cache.Get(normIMDb); err == nil && found && len(existing) > 0 {
+						existingIDs := make(map[string]bool)
+						for _, r := range res {
+							existingIDs[r.ID+"_"+r.Tracker] = true
+						}
+						for _, er := range existing {
+							key := er.ID + "_" + er.Tracker
+							if !existingIDs[key] {
+								existingIDs[key] = true
+								res = append(res, er)
+							}
 						}
 					}
 				}
