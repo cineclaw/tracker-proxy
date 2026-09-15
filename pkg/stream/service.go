@@ -82,6 +82,29 @@ type PlayerInfoResponse struct {
 	TranscodeStreamURL string              `json:"transcode_stream_url,omitempty"`
 }
 
+type StreamStatsResponse struct {
+	Success          bool    `json:"success"`
+	Hash             string  `json:"hash"`
+	DownloadSpeed    float64 `json:"download_speed"`     // bytes per second
+	UploadSpeed      float64 `json:"upload_speed"`       // bytes per second
+	DownloadSpeedFmt string  `json:"download_speed_fmt"` // e.g. "14.2 МБ/с" or "850 КБ/с"
+	UploadSpeedFmt   string  `json:"upload_speed_fmt"`   // e.g. "1.2 МБ/с"
+	ConnectedSeeders int     `json:"connected_seeders"`
+	ActivePeers      int     `json:"active_peers"`
+	TotalPeers       int     `json:"total_peers"`
+	HalfOpenPeers    int     `json:"half_open_peers"`
+	LoadedSize       int64   `json:"loaded_size"`
+	TorrentSize      int64   `json:"torrent_size"`
+	PreloadedBytes   int64   `json:"preloaded_bytes"`
+	VideoBitrate     int64   `json:"video_bitrate"`     // bits per second
+	VideoBitrateFmt  string  `json:"video_bitrate_fmt"` // e.g. "18.5 Мбит/с"
+	SpeedRatio       float64 `json:"speed_ratio"`       // DownloadSpeed / VideoBitrateBytes
+	SignalLevel      int     `json:"signal_level"`      // 0..4 (0=none, 1=crit, 2=fair, 3=good, 4=excel)
+	SignalStatus     string  `json:"signal_status"`     // "Отличный", "Стабильный", "Умеренный", "Слабый", "Поиск"
+	Stat             int     `json:"stat"`
+	StatString       string  `json:"stat_string"`
+}
+
 type MountRequest struct {
 	Tconst      string `json:"tconst"`
 	Title       string `json:"title"`
@@ -490,24 +513,69 @@ func (s *TorrStreamService) StartTorrentIdleReaper(ctx context.Context, interval
 
 // MountTorrent adds the torrent to TorrServer and prepares it for instant playback
 func (s *TorrStreamService) MountTorrent(ctx context.Context, req MountRequest) (*MountResponse, error) {
-	log.Printf("[stream] MountTorrent requested: title=%q tconst=%q magnet=%t season=%d", req.Title, req.Tconst, req.Magnet != "", req.Season)
+	log.Printf("[stream] MountTorrent requested: title=%q tconst=%q magnet=%t season=%d torrent_id=%q tracker=%q",
+		req.Title, req.Tconst, req.Magnet != "", req.Season, req.TorrentID, req.Tracker)
 
-	if req.Magnet == "" && req.TorrentID != "" && req.Tracker != "" && s.aggregator != nil {
-		hash, err := s.aggregator.ResolveInfoHash(ctx, req.Tracker, req.TorrentID)
-		if err == nil && hash != "" {
-			req.Magnet = aggregator.BuildMultiTrackerMagnet(hash, req.Title, nil, []string{req.Tracker})
+	// 1. Sanitize magnet link if it contains an invalid/truncated hash (e.g. topic ID "1705789")
+	if req.Magnet != "" {
+		rawHash := ExtractHashFromMagnet(req.Magnet)
+		if rawHash == "" {
+			if strings.HasPrefix(req.Magnet, "magnet:?xt=urn:btih:") {
+				possibleID := strings.TrimPrefix(req.Magnet, "magnet:?xt=urn:btih:")
+				if amp := strings.IndexAny(possibleID, "&/?#"); amp != -1 {
+					possibleID = possibleID[:amp]
+				}
+				if possibleID != "" && req.TorrentID == "" {
+					req.TorrentID = possibleID
+				}
+			}
+			req.Magnet = ""
+		}
+	}
+
+	// 2. If magnet is missing or invalid, attempt to resolve via tracker topic ID or hash
+	if req.Magnet == "" && (req.TorrentID != "" || req.DetailsURL != "" || (req.RuTitle != "" && IsValidInfoHash(req.RuTitle))) && s.aggregator != nil {
+		topicID := req.TorrentID
+		if topicID == "" && req.RuTitle != "" && IsValidInfoHash(req.RuTitle) {
+			topicID = req.RuTitle
+		}
+
+		if IsValidInfoHash(topicID) {
+			trackers := []string{}
+			if req.Tracker != "" {
+				trackers = append(trackers, req.Tracker)
+			}
+			req.Magnet = aggregator.BuildMultiTrackerMagnet(topicID, req.Title, nil, trackers)
+		} else if topicID != "" {
+			trackerName := strings.ToLower(req.Tracker)
+			var resolvedHash string
+			var err error
+			if trackerName != "" {
+				resolvedHash, err = s.aggregator.ResolveInfoHash(ctx, trackerName, topicID)
+			} else {
+				for _, tr := range []string{"nnmclub", "rutracker", "rutor"} {
+					resolvedHash, err = s.aggregator.ResolveInfoHash(ctx, tr, topicID)
+					if err == nil && resolvedHash != "" {
+						trackerName = tr
+						break
+					}
+				}
+			}
+			if err == nil && resolvedHash != "" && IsValidInfoHash(resolvedHash) {
+				req.Magnet = aggregator.BuildMultiTrackerMagnet(resolvedHash, req.Title, nil, []string{trackerName})
+			}
 		}
 	}
 
 	if req.Magnet == "" {
 		return &MountResponse{
 			Success: false,
-			Message: "Отсутствует magnet-ссылка",
-		}, fmt.Errorf("magnet link is required")
+			Message: "Отсутствует корректная magnet-ссылка (не удалось определить infohash)",
+		}, fmt.Errorf("magnet link could not be resolved")
 	}
 
 	hash := ExtractHashFromMagnet(req.Magnet)
-	if hash == "" {
+	if hash == "" || !IsValidInfoHash(hash) {
 		return &MountResponse{
 			Success: false,
 			Message: "Некорректная magnet-ссылка (отсутствует infohash)",
@@ -784,53 +852,56 @@ func (s *TorrStreamService) HandleJellyfinItemDeleted(ctx context.Context, paylo
 
 // ScoreCandidate evaluates how well a torrent candidate matches the intended title, metadata, and season.
 func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int {
-	score := c.Seeds * 10
-	if score > 1000 {
-		score = 1000 // cap raw seed contribution so seed count cannot overwhelm relevance
+	score := 0
+	// Seeds contribution: seeders reflect swarm health and download speed
+	if c.Seeds > 0 {
+		if c.Seeds > 3000 {
+			score += 3000 + (c.Seeds-3000)/10
+		} else {
+			score += c.Seeds
+		}
 	}
 
 	titleLower := strings.ToLower(c.Title)
 	if strings.Contains(titleLower, "1080p") {
-		score += 30
-	} else if strings.Contains(titleLower, "2160p") || strings.Contains(titleLower, "4k") {
-		score += 20
+		score += 300
+	} else if strings.Contains(titleLower, "2160p") || strings.Contains(titleLower, "4k") || strings.Contains(titleLower, "uhd") {
+		score += 250
 	} else if strings.Contains(titleLower, "720p") {
-		score += 10
+		score += 150
 	}
 
 	if meta != nil {
-		cRus, cOrig, cStartYear, cEndYear, isOngoing, _, _ := hotlist.ParseReleaseDetails(c.Title)
+		cRus, cOrig, cStartYear, _, isOngoing, _, _ := hotlist.ParseReleaseDetails(c.Title)
 
-		// 1. Year matching (crucial for movies and disambiguation)
+		// 1. Year matching
 		if meta.Year > 0 {
 			if cStartYear > 0 {
-				if cStartYear == meta.Year {
-					score += 600 // exact year match
-				} else if cStartYear == meta.Year-1 || cStartYear == meta.Year+1 {
-					score += 300 // acceptable boundary year (festival release vs tracker upload)
-				} else if season <= 0 {
-					// Major movie year mismatch
-					diff := cStartYear - meta.Year
-					if diff < 0 {
-						diff = -diff
+				if season <= 0 {
+					// Movie: strict matching around release year
+					if cStartYear == meta.Year {
+						score += 600
+					} else if cStartYear == meta.Year-1 || cStartYear == meta.Year+1 {
+						score += 300
+					} else {
+						diff := cStartYear - meta.Year
+						if diff < 0 {
+							diff = -diff
+						}
+						score -= diff * 500
 					}
-					score -= diff * 500
 				} else {
-					// For series, check if release year is within series range
+					// TV Series: timeline spans from series start year up to current year + 1
 					currentYear := time.Now().Year()
 					if cStartYear >= meta.Year-1 && cStartYear <= currentYear+1 {
-						score += 200 // TV series release within valid air timeline
+						score += 600 // perfectly valid season air year in series timeline
 					} else {
-						score -= 2000 // Year is from before the TV show even existed!
+						score -= 2000 // Year is before the series existed
 					}
 				}
 			}
-			// Bonus for multi-year TV packs
-			if season > 0 && cEndYear > cStartYear && cStartYear >= meta.Year-1 {
-				score += 250 // complete pack
-			}
 			if season > 0 && isOngoing {
-				score += 150
+				score += 100
 			}
 		}
 
@@ -839,11 +910,11 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 			origClean := strings.ToLower(strings.TrimSpace(meta.OriginalTitle))
 			if len(origClean) >= 3 {
 				if strings.Contains(titleLower, origClean) {
-					score += 600 // exact original title found in release
+					score += 600
 				} else if cOrig != "" && strings.EqualFold(cOrig, origClean) {
 					score += 600
 				} else if cOrig != "" && !strings.Contains(strings.ToLower(cOrig), origClean) && !strings.Contains(origClean, strings.ToLower(cOrig)) {
-					score -= 3000 // candidate has a completely different original title!
+					score -= 3000 // completely different original title
 				}
 			}
 		}
@@ -855,7 +926,7 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 				if cRus != "" {
 					cRusLower := strings.ToLower(strings.TrimSpace(cRus))
 					if cRusLower == rusClean {
-						score += 400 // exact Russian title match
+						score += 400
 					} else if strings.HasPrefix(cRusLower, rusClean+" ") || strings.Contains(cRusLower, " "+rusClean) {
 						score += 150
 					}
@@ -866,7 +937,9 @@ func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int 
 
 	if season > 0 {
 		if len(c.Seasons) == 1 && c.Seasons[0] == season {
-			score += 150
+			score += 400 // exact single-season target match
+		} else if c.IsComplete {
+			score += 150 // complete series pack
 		}
 	}
 
@@ -1050,6 +1123,42 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 				if sn == season {
 					pool = append(pool, c)
 					break
+				}
+			}
+		}
+
+		if len(pool) == 0 && s.aggregator != nil && meta != nil {
+			baseTitle := strings.TrimSpace(meta.Title)
+			if baseTitle == "" {
+				baseTitle = strings.TrimSpace(meta.OriginalTitle)
+			}
+			if baseTitle != "" {
+				seasonQueries := []string{
+					fmt.Sprintf("%s %d сезон", baseTitle, season),
+					fmt.Sprintf("%s S%02d", baseTitle, season),
+				}
+				for _, sq := range seasonQueries {
+					seasonRes := s.aggregator.Search(ctx, models.SearchQuery{
+						Query:  sq,
+						Type:   "tv",
+						IMDbID: normIMDb,
+						Limit:  30,
+					})
+					for _, sr := range seasonRes {
+						sr.Seasons, sr.IsComplete = tracker.ExtractSeasonInfo(sr.Title)
+						sr.Resolution = tracker.ExtractResolution(sr.Title)
+						candidates = append(candidates, sr)
+						isMatch := sr.IsComplete
+						for _, sn := range sr.Seasons {
+							if sn == season {
+								isMatch = true
+								break
+							}
+						}
+						if isMatch {
+							pool = append(pool, sr)
+						}
+					}
 				}
 			}
 		}
@@ -2082,5 +2191,179 @@ func cleanAudioCodec(c string) string {
 	c = strings.TrimPrefix(c, "audio/x-")
 	c = strings.TrimPrefix(c, "audio/")
 	return strings.ToUpper(strings.TrimSpace(c))
+}
+
+func FormatSpeed(bytesPerSec float64) string {
+	if bytesPerSec <= 0 {
+		return "0 КБ/с"
+	}
+	if bytesPerSec >= 1024*1024*1024 {
+		return fmt.Sprintf("%.1f ГБ/с", bytesPerSec/(1024*1024*1024))
+	}
+	if bytesPerSec >= 1024*1024 {
+		return fmt.Sprintf("%.1f МБ/с", bytesPerSec/(1024*1024))
+	}
+	return fmt.Sprintf("%.0f КБ/с", bytesPerSec/1024)
+}
+
+func FormatBitrate(bitsPerSec int64) string {
+	if bitsPerSec <= 0 {
+		return "0 Мбит/с"
+	}
+	if bitsPerSec >= 1_000_000_000 {
+		return fmt.Sprintf("%.1f Гбит/с", float64(bitsPerSec)/1_000_000_000)
+	}
+	if bitsPerSec >= 1_000_000 {
+		return fmt.Sprintf("%.1f Мбит/с", float64(bitsPerSec)/1_000_000)
+	}
+	return fmt.Sprintf("%d Кбит/с", bitsPerSec/1000)
+}
+
+// GetStreamStats retrieves active swarm statistics from TorrServer and evaluates signal quality vs video bitrate
+func (s *TorrStreamService) GetStreamStats(ctx context.Context, hash, tconst string, fileIdx, season, episode int, clientDuration float64) (*StreamStatsResponse, error) {
+	effectiveHash := hash
+	if effectiveHash == "" && tconst != "" {
+		s.mu.RLock()
+		if season > 0 {
+			if m, ok := s.mountedTorrents[fmt.Sprintf("%s:s%d", tconst, season)]; ok && m != nil {
+				effectiveHash = m.Hash
+			}
+		}
+		if effectiveHash == "" {
+			if m, ok := s.mountedTorrents[tconst]; ok && m != nil {
+				effectiveHash = m.Hash
+			}
+		}
+		s.mu.RUnlock()
+
+		if effectiveHash == "" && s.playbackStore != nil {
+			if prog, _ := s.playbackStore.GetItemProgress(tconst, season, episode); prog != nil && prog.TorrentHash != "" {
+				effectiveHash = prog.TorrentHash
+			} else if lastEp, _ := s.playbackStore.GetLatestWatchedEpisode(tconst); lastEp != nil && lastEp.TorrentHash != "" {
+				effectiveHash = lastEp.TorrentHash
+			}
+		}
+	}
+
+	if effectiveHash == "" {
+		return &StreamStatsResponse{
+			Success:      false,
+			SignalStatus: "Поиск раздачи",
+		}, nil
+	}
+
+	rec, err := s.torrClient.GetTorrent(ctx, effectiveHash)
+	if err != nil || rec == nil {
+		return &StreamStatsResponse{
+			Success:      false,
+			Hash:         effectiveHash,
+			SignalStatus: "Нет связи с TorrServer",
+		}, nil
+	}
+
+	var targetFileLength int64 = 0
+	if len(rec.FileStats) > 0 {
+		if fileIdx > 0 {
+			for _, f := range rec.FileStats {
+				if f.ID == fileIdx {
+					targetFileLength = f.Length
+					break
+				}
+			}
+		}
+		if targetFileLength == 0 {
+			matched, matchErr := s.torrClient.MatchFile(rec, season, episode)
+			if matchErr == nil && matched != nil {
+				targetFileLength = matched.Length
+			} else {
+				targetFileLength = rec.FileStats[0].Length
+			}
+		}
+	}
+	if targetFileLength == 0 {
+		targetFileLength = rec.TorrentSize
+	}
+
+	effectiveDuration := clientDuration
+	if effectiveDuration <= 0 && targetFileLength > 0 {
+		if meta := s.fetchIndexerMeta(ctx, tconst); meta != nil && meta.RuntimeMinutes != nil && *meta.RuntimeMinutes > 0 {
+			effectiveDuration = float64(*meta.RuntimeMinutes * 60)
+		}
+	}
+	if effectiveDuration <= 0 {
+		if season > 0 {
+			effectiveDuration = 2700.0 // 45 min
+		} else {
+			effectiveDuration = 6300.0 // 105 min
+		}
+	}
+
+	var videoBitrate int64 = 0
+	if targetFileLength > 0 && effectiveDuration > 0 {
+		videoBitrate = int64(float64(targetFileLength*8) / effectiveDuration)
+	}
+
+	downloadSpeed := rec.DownloadSpeed
+	uploadSpeed := rec.UploadSpeed
+	var speedRatio float64 = 0
+	signalLevel := 0
+	signalStatus := "Поиск пиров"
+
+	if downloadSpeed > 0 {
+		if videoBitrate > 0 {
+			speedRatio = (downloadSpeed * 8.0) / float64(videoBitrate)
+			if speedRatio >= 1.5 {
+				signalLevel = 4
+				signalStatus = "Отличный сигнал"
+			} else if speedRatio >= 1.0 {
+				signalLevel = 3
+				signalStatus = "Стабильный сигнал"
+			} else if speedRatio >= 0.5 {
+				signalLevel = 2
+				signalStatus = "Умеренный сигнал"
+			} else {
+				signalLevel = 1
+				signalStatus = "Слабый сигнал"
+			}
+		} else {
+			// Bitrate not calculable: fallback to absolute speed thresholds
+			if downloadSpeed >= 8*1024*1024 {
+				signalLevel = 4
+				signalStatus = "Отличный сигнал"
+			} else if downloadSpeed >= 3*1024*1024 {
+				signalLevel = 3
+				signalStatus = "Стабильный сигнал"
+			} else if downloadSpeed >= 1024*1024 {
+				signalLevel = 2
+				signalStatus = "Умеренный сигнал"
+			} else {
+				signalLevel = 1
+				signalStatus = "Слабый сигнал"
+			}
+		}
+	}
+
+	return &StreamStatsResponse{
+		Success:          true,
+		Hash:             effectiveHash,
+		DownloadSpeed:    downloadSpeed,
+		UploadSpeed:      uploadSpeed,
+		DownloadSpeedFmt: FormatSpeed(downloadSpeed),
+		UploadSpeedFmt:   FormatSpeed(uploadSpeed),
+		ConnectedSeeders: rec.ConnectedSeeders,
+		ActivePeers:      rec.ActivePeers,
+		TotalPeers:       rec.TotalPeers,
+		HalfOpenPeers:    rec.HalfOpenPeers,
+		LoadedSize:       rec.LoadedSize,
+		TorrentSize:      rec.TorrentSize,
+		PreloadedBytes:   rec.PreloadedBytes,
+		VideoBitrate:     videoBitrate,
+		VideoBitrateFmt:  FormatBitrate(videoBitrate),
+		SpeedRatio:       speedRatio,
+		SignalLevel:      signalLevel,
+		SignalStatus:     signalStatus,
+		Stat:             rec.Stat,
+		StatString:       rec.StatString,
+	}, nil
 }
 

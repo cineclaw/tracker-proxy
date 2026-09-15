@@ -4,6 +4,43 @@ import (
 	"testing"
 )
 
+func TestIsValidInfoHash(t *testing.T) {
+	tests := []struct {
+		hash  string
+		valid bool
+	}{
+		{"76c12d37b02c6cfcfc5c7656880e64047c80c5c1", true},
+		{"4532645F37A3BAB9E931060F6399ED24F45903E1", true},
+		{"1705789", false}, // Topic ID, not infohash
+		{"", false},
+		{"invalid-hash-string-xyz", false},
+	}
+
+	for _, tt := range tests {
+		if got := IsValidInfoHash(tt.hash); got != tt.valid {
+			t.Errorf("IsValidInfoHash(%q) = %v, expected %v", tt.hash, got, tt.valid)
+		}
+	}
+}
+
+func TestExtractHashFromMagnet(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"magnet:?xt=urn:btih:76c12d37b02c6cfcfc5c7656880e64047c80c5c1&dn=Test", "76c12d37b02c6cfcfc5c7656880e64047c80c5c1"},
+		{"magnet:?xt=urn:btih:1705789", ""}, // Invalid/short hash rejected
+		{"76c12d37b02c6cfcfc5c7656880e64047c80c5c1", "76c12d37b02c6cfcfc5c7656880e64047c80c5c1"},
+		{"1705789", ""},
+	}
+
+	for _, tt := range tests {
+		if got := ExtractHashFromMagnet(tt.input); got != tt.expected {
+			t.Errorf("ExtractHashFromMagnet(%q) = %q, expected %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
 func TestParseSeasonEpisode(t *testing.T) {
 	tests := []struct {
 		path      string

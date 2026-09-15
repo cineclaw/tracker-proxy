@@ -102,6 +102,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/torrents/status", h.corsMiddleware(h.handleStreamStatus))
 
 	// Video player & progress sync endpoints
+	mux.HandleFunc("/api/stream/stats", h.corsMiddleware(h.handleStreamStats))
+	mux.HandleFunc("/stream/stats", h.corsMiddleware(h.handleStreamStats))
 	mux.HandleFunc("/api/stream/player/info", h.corsMiddleware(h.handlePlayerInfo))
 	mux.HandleFunc("/api/stream/player/start", h.corsMiddleware(h.handlePlayerStart))
 	mux.HandleFunc("/api/stream/player/progress", h.corsMiddleware(h.handlePlayerProgress))
@@ -431,10 +433,23 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 					return stream.ScoreCandidate(&filtered[i], meta, season) > stream.ScoreCandidate(&filtered[j], meta, season)
 				})
 			}
-			if limit > 0 && len(filtered) > limit {
-				filtered = filtered[:limit]
+
+			// If general search (season == 0) or season was found in cache
+			hasSeasonMatch := false
+			if season > 0 {
+				for _, it := range filtered {
+					if (len(it.Seasons) == 1 && it.Seasons[0] == season) || it.IsComplete {
+						hasSeasonMatch = true
+						break
+					}
+				}
 			}
-			return filtered, "HIT"
+			if season == 0 || hasSeasonMatch || len(filtered) >= 2 {
+				if limit > 0 && len(filtered) > limit {
+					filtered = filtered[:limit]
+				}
+				return filtered, "HIT"
+			}
 		}
 	}
 
@@ -450,7 +465,12 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 			cacheStatus = "MISS"
 		}
 
-		v, err, _ := h.sf.Do(normIMDb, func() (any, error) {
+		sfKey := normIMDb
+		if season > 0 {
+			sfKey = fmt.Sprintf("%s:s%d", normIMDb, season)
+		}
+
+		v, err, _ := h.sf.Do(sfKey, func() (any, error) {
 			res := h.aggregator.Search(ctx, models.SearchQuery{
 				Query:        queryStr,
 				Type:         mediaType,
@@ -467,7 +487,58 @@ func (h *Handler) executeSearch(ctx context.Context, queryStr, imdbID, mediaType
 					Limit:        limit,
 				})
 			}
+
+			// If TV series season requested, also search with season-specific queries
+			if season > 0 && meta != nil {
+				baseTitle := strings.TrimSpace(meta.Title)
+				if baseTitle == "" {
+					baseTitle = strings.TrimSpace(meta.OriginalTitle)
+				}
+				if baseTitle != "" {
+					seasonQueries := []string{
+						fmt.Sprintf("%s %d сезон", baseTitle, season),
+						fmt.Sprintf("%s S%02d", baseTitle, season),
+					}
+					for _, sq := range seasonQueries {
+						seasonRes := h.aggregator.Search(ctx, models.SearchQuery{
+							Query:        sq,
+							Type:         "tv",
+							IMDbID:       normIMDb,
+							RefreshCache: refreshCache,
+							Limit:        limit,
+						})
+						if len(seasonRes) > 0 {
+							existingIDs := make(map[string]bool)
+							for _, r := range res {
+								existingIDs[r.ID+"_"+r.Tracker] = true
+							}
+							for _, sr := range seasonRes {
+								key := sr.ID + "_" + sr.Tracker
+								if !existingIDs[key] {
+									existingIDs[key] = true
+									res = append(res, sr)
+								}
+							}
+						}
+					}
+				}
+			}
+
 			if h.cache != nil && len(res) > 0 {
+				// Merge with existing cached items if any
+				if existing, found, err := h.cache.Get(normIMDb); err == nil && found && len(existing) > 0 {
+					existingIDs := make(map[string]bool)
+					for _, r := range res {
+						existingIDs[r.ID+"_"+r.Tracker] = true
+					}
+					for _, er := range existing {
+						key := er.ID + "_" + er.Tracker
+						if !existingIDs[key] {
+							existingIDs[key] = true
+							res = append(res, er)
+						}
+					}
+				}
 				_ = h.cache.Set(normIMDb, queryStr, res)
 			}
 			return res, nil
@@ -750,6 +821,45 @@ func (h *Handler) handleJellyfinItemDeleted(w http.ResponseWriter, r *http.Reque
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (h *Handler) handleStreamStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hash := r.URL.Query().Get("hash")
+	tconst := r.URL.Query().Get("tconst")
+	fileIdx, _ := strconv.Atoi(firstNonEmpty(r.URL.Query().Get("file_idx"), r.URL.Query().Get("index"), r.URL.Query().Get("id")))
+	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
+	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+	var clientDuration float64 = 0
+	if dStr := r.URL.Query().Get("duration"); dStr != "" {
+		if f, err := strconv.ParseFloat(dStr, 64); err == nil {
+			clientDuration = f
+		}
+	}
+
+	if h.mounter == nil {
+		http.Error(w, "Stream service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	stats, err := h.mounter.GetStreamStats(r.Context(), hash, tconst, fileIdx, season, episode, clientDuration)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	_ = json.NewEncoder(w).Encode(stats)
 }
 
 func (h *Handler) handlePlayerInfo(w http.ResponseWriter, r *http.Request) {

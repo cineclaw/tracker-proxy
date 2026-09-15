@@ -3,6 +3,7 @@ package rutracker
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -177,22 +178,32 @@ func (t *Tracker) EnsureClearance(ctx context.Context) error {
 	t.stateMu.Unlock()
 
 	log.Printf("[rutracker] Cloudflare clearance successfully acquired via FlareSolverr (User-Agent: %s)", solution.UserAgent)
+	
+	// Automatically authenticate after acquiring clearance if credentials exist
+	if t.username != "" && t.password != "" {
+		_ = t.loginInternal(ctx)
+	}
 	return nil
 }
 
 func (t *Tracker) Login(ctx context.Context) error {
+	return t.loginInternal(ctx)
+}
+
+func (t *Tracker) loginInternal(ctx context.Context) error {
 	t.stateMu.RLock()
 	user := t.username
 	pass := t.password
 	ua := t.userAgent
 	last := t.lastLogin
+	currentCookie := t.cookie
 	t.stateMu.RUnlock()
 
 	if user == "" || pass == "" {
 		return nil
 	}
 
-	if time.Since(last) < 15*time.Minute && !last.IsZero() {
+	if time.Since(last) < 15*time.Minute && !last.IsZero() && strings.Contains(currentCookie, "bb_session") {
 		return nil
 	}
 
@@ -200,6 +211,7 @@ func (t *Tracker) Login(ctx context.Context) error {
 	formData := url.Values{
 		"login_username": {user},
 		"login_password": {pass},
+		"login_ssl":      {"1"},
 		"login":          {"Вход"},
 	}
 
@@ -210,6 +222,9 @@ func (t *Tracker) Login(ctx context.Context) error {
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", ua)
+	if currentCookie != "" {
+		req.Header.Set("Cookie", currentCookie)
+	}
 
 	resp, err := t.client.Do(req)
 	if err != nil {
@@ -218,19 +233,31 @@ func (t *Tracker) Login(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	t.stateMu.Lock()
+	for _, c := range resp.Cookies() {
+		t.setOrReplaceCookie(c.Name, c.Value)
+	}
+	u, _ := url.Parse(t.baseURL)
+	if u != nil {
+		for _, c := range t.jar.Cookies(u) {
+			t.setOrReplaceCookie(c.Name, c.Value)
+		}
+	}
 	t.lastLogin = time.Now()
 	t.stateMu.Unlock()
+	log.Printf("[rutracker] Logged in as %s, session cookies updated (cookies: %s)", user, t.cookie)
 	return nil
 }
 
 var (
 	rutrackerMovieForums = []int{
-		1457, 1940, 271, 313, 312, 2339, 252, 1950, 2200, 941,
-		1666, 124, 352, 4, 1105, 1936, 314, 46,
+		7, 209, 212, 313, 312, 2339, 2200, 2201, 2548, 2198,
+		1543, 1666, 941, 22, 271, 252, 1950, 124, 1936, 352,
+		4, 1105, 314, 46,
 	}
 
 	rutrackerSeriesForums = []int{
-		119, 1171, 2366, 1803, 842, 812, 81, 920, 921, 1106, 315,
+		119, 189, 2366, 1803, 1457, 1940, 208, 1890, 2109,
+		1171, 812, 842, 81, 920, 921, 1106, 315, 1460,
 	}
 )
 
@@ -265,8 +292,13 @@ func buildRuTrackerForumFilter(mediaType string) string {
 	return sb.String()
 }
 
-func (t *Tracker) doSearch(ctx context.Context, queryEncoded, forumFilter string) (*http.Response, error) {
-	searchURL := fmt.Sprintf("%s/forum/tracker.php?nm=%s%s", t.baseURL, queryEncoded, forumFilter)
+func (t *Tracker) doSearch(ctx context.Context, queryEncoded string, start int) (*http.Response, error) {
+	startParam := ""
+	if start > 0 {
+		startParam = fmt.Sprintf("&start=%d", start)
+	}
+	// o=10: sort by Seeders, s=2: descending
+	searchURL := fmt.Sprintf("%s/forum/tracker.php?nm=%s&o=10&s=2%s", t.baseURL, queryEncoded, startParam)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
 	if err != nil {
 		return nil, err
@@ -299,49 +331,102 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to encode query to CP1251: %w", err)
 	}
 
-	forumFilter := buildRuTrackerForumFilter(query.Type)
-	resp, err := t.doSearch(ctx, queryEncoded, forumFilter)
-
-	if err != nil {
-		return nil, fmt.Errorf("rutracker search request failed: %w", err)
+	// Ensure login if credentials provided and bb_session not present
+	if t.username != "" && t.password != "" && !strings.Contains(t.cookie, "bb_session") {
+		_ = t.Login(ctx)
 	}
 
-	// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution
-	if resp.StatusCode == http.StatusForbidden && t.flaresolverrClient != nil {
-		resp.Body.Close()
-		log.Printf("[rutracker] Received HTTP 403 Forbidden; acquiring Cloudflare clearance via FlareSolverr...")
+	var allResults []models.TorrentResult
 
-		solveCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
-		defer cancel()
+	// Fetch up to 2-3 pages (100-150 results) sorted by seeders DESC
+	maxPages := 2
+	if query.Limit > 50 {
+		maxPages = 3
+	}
 
-		if solveErr := t.EnsureClearance(solveCtx); solveErr != nil {
-			return nil, fmt.Errorf("failed to solve cloudflare challenge: %w", solveErr)
-		}
-
-		// Retry login if credentials exist and bb_session was not provided
-		if t.username != "" && t.password != "" && !strings.Contains(t.cookie, "bb_session") {
-			_ = t.Login(solveCtx)
-		}
-
-		// Retry search request with fresh clearance and User-Agent
-		resp, err = t.doSearch(ctx, queryEncoded, forumFilter)
+	for page := 0; page < maxPages; page++ {
+		start := page * 50
+		resp, err := t.doSearch(ctx, queryEncoded, start)
 		if err != nil {
-			return nil, fmt.Errorf("rutracker retry search failed: %w", err)
+			if page == 0 {
+				return nil, fmt.Errorf("rutracker search request failed: %w", err)
+			}
+			break
 		}
 
-	}
-	defer resp.Body.Close()
+		// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution
+		if resp.StatusCode == http.StatusForbidden && t.flaresolverrClient != nil {
+			resp.Body.Close()
+			log.Printf("[rutracker] Received HTTP 403 Forbidden; acquiring Cloudflare clearance via FlareSolverr...")
 
-	if resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("rutracker returned 403 Forbidden (Cloudflare Turnstile challenge requires valid cookie/clearance)")
+			solveCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+			if solveErr := t.EnsureClearance(solveCtx); solveErr != nil {
+				cancel()
+				if page == 0 {
+					return nil, fmt.Errorf("failed to solve cloudflare challenge: %w", solveErr)
+				}
+				break
+			}
+			cancel()
+
+			// Retry login if credentials exist and bb_session was not provided
+			if t.username != "" && t.password != "" && !strings.Contains(t.cookie, "bb_session") {
+				solveCtx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+				_ = t.Login(solveCtx2)
+				cancel2()
+			}
+
+			// Retry search request with fresh clearance and User-Agent
+			resp, err = t.doSearch(ctx, queryEncoded, start)
+			if err != nil {
+				if page == 0 {
+					return nil, fmt.Errorf("rutracker retry search failed: %w", err)
+				}
+				break
+			}
+		}
+
+		if resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			if page == 0 {
+				return nil, fmt.Errorf("rutracker returned 403 Forbidden (Cloudflare Turnstile challenge requires valid cookie/clearance)")
+			}
+			break
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if page == 0 {
+				return nil, fmt.Errorf("rutracker returned HTTP %d", resp.StatusCode)
+			}
+			break
+		}
+
+		pageResults, parseErr := t.parseResults(resp.Body, query.Limit)
+		resp.Body.Close()
+		if parseErr != nil {
+			if page == 0 {
+				return nil, parseErr
+			}
+			break
+		}
+
+		if len(pageResults) == 0 {
+			break
+		}
+
+		allResults = append(allResults, pageResults...)
+		if len(pageResults) < 50 || (query.Limit > 0 && len(allResults) >= query.Limit) {
+			break
+		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("rutracker returned HTTP %d", resp.StatusCode)
-	}
+	return allResults, nil
+}
 
+func (t *Tracker) parseResults(body io.Reader, limit int) ([]models.TorrentResult, error) {
 	// Decode response from CP1251
-	utf8Reader := encoding.NewCP1251Reader(resp.Body)
+	utf8Reader := encoding.NewCP1251Reader(body)
 	doc, err := goquery.NewDocumentFromReader(utf8Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse rutracker html: %w", err)
@@ -430,7 +515,7 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 			PublishDate: pubDate,
 		})
 
-		if query.Limit > 0 && len(results) >= query.Limit {
+		if limit > 0 && len(results) >= limit {
 			return
 		}
 	})

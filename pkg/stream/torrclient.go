@@ -98,7 +98,14 @@ type TorrentRecord struct {
 	LoadedSize       int64             `json:"loaded_size,omitempty"`
 	TorrentSize      int64             `json:"torrent_size,omitempty"`
 	DownloadSpeed    float64           `json:"download_speed,omitempty"`
+	UploadSpeed      float64           `json:"upload_speed,omitempty"`
 	ConnectedSeeders int               `json:"connected_seeders,omitempty"`
+	ActivePeers      int               `json:"active_peers,omitempty"`
+	TotalPeers       int               `json:"total_peers,omitempty"`
+	HalfOpenPeers    int               `json:"half_open_peers,omitempty"`
+	PreloadedBytes   int64             `json:"preloaded_bytes,omitempty"`
+	BytesRead        int64             `json:"bytes_read,omitempty"`
+	BytesWritten     int64             `json:"bytes_written,omitempty"`
 }
 
 type ProbeTrack struct {
@@ -725,11 +732,32 @@ func splitIntoChunks(s string) []string {
 	return chunks
 }
 
-// ExtractHashFromMagnet parses 40-char or 32-char infohash from magnet link
+// IsValidInfoHash checks if a string is a valid BitTorrent infohash (40 hex, 32 base32, or 64 hex)
+func IsValidInfoHash(h string) bool {
+	h = strings.TrimSpace(h)
+	l := len(h)
+	if l != 40 && l != 32 && l != 64 {
+		return false
+	}
+	for _, c := range h {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			if l == 32 && ((c >= '2' && c <= '7') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractHashFromMagnet parses 40-char, 32-char, or 64-char infohash from magnet link or raw hash
 func ExtractHashFromMagnet(link string) string {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return ""
+	}
 	if !strings.HasPrefix(link, "magnet:") {
-		// Check if it's already a 40-char hex hash
-		if len(link) == 40 {
+		if IsValidInfoHash(link) {
 			return strings.ToLower(link)
 		}
 		return ""
@@ -737,11 +765,24 @@ func ExtractHashFromMagnet(link string) string {
 
 	u, err := url.Parse(link)
 	if err != nil {
+		if idx := strings.Index(link, "urn:btih:"); idx != -1 {
+			raw := link[idx+9:]
+			if amp := strings.IndexAny(raw, "&/?#"); amp != -1 {
+				raw = raw[:amp]
+			}
+			if IsValidInfoHash(raw) {
+				return strings.ToLower(raw)
+			}
+		}
 		return ""
 	}
 	xt := u.Query().Get("xt")
 	if strings.HasPrefix(xt, "urn:btih:") {
-		return strings.ToLower(strings.TrimPrefix(xt, "urn:btih:"))
+		raw := strings.TrimPrefix(xt, "urn:btih:")
+		if IsValidInfoHash(raw) {
+			return strings.ToLower(raw)
+		}
 	}
 	return ""
 }
+

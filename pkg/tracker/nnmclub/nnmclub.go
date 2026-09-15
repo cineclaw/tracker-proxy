@@ -195,9 +195,9 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 		return nil, fmt.Errorf("failed to encode query to CP1251: %w", err)
 	}
 
-	forumFilter := buildNNMForumFilter(query.Type)
 	searchURL := fmt.Sprintf("%s/forum/tracker.php", t.baseURL)
-	postBody := fmt.Sprintf("o=1&s=2&tm=-1&shf=1&sha=1&ta=-1&sns=-1&sds=-1%s&nm=%s&submit=%%CF%%EE%%E8%%F1%%EA", forumFilter, queryEncoded)
+	// o=10: sort by Seeders, s=2: descending
+	postBody := fmt.Sprintf("o=10&s=2&tm=-1&shf=1&sha=1&ta=-1&sns=-1&sds=-1&nm=%s&submit=%%CF%%EE%%E8%%F1%%EA", queryEncoded)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, searchURL, strings.NewReader(postBody))
 	if err != nil {
