@@ -523,8 +523,8 @@ func (s *TorrStreamService) probeChapters(ctx context.Context, hash string, file
 		return nil
 	}
 
-	torrURL := fmt.Sprintf("%s/stream?link=%s&index=%d", s.torrServerURL, hash, fileId)
-	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	torrURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", s.torrServerURL, hash, fileId)
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(probeCtx, ffprobePath,
@@ -1783,9 +1783,9 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		skipSegments, _ = s.playbackStore.GetSkipSegments(tconst, season, episode, hash, targetFileIdx)
 	}
 
-	if len(skipSegments) == 0 && hash != "" && targetFileIdx > 0 {
-		// Fast probe attempt (up to 1500ms)
-		probeChCtx, probeChCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	if len(skipSegments) == 0 && hash != "" && targetFileIdx >= 0 {
+		// Fast probe attempt (up to 2500ms)
+		probeChCtx, probeChCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 		chapters := s.probeChapters(probeChCtx, hash, targetFileIdx)
 		probeChCancel()
 
