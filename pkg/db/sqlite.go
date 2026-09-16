@@ -98,6 +98,23 @@ func (db *DB) migrate() error {
 			audio_index INTEGER NOT NULL DEFAULT 0,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS media_skip_segments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			imdb_id TEXT NOT NULL,
+			season_number INTEGER NOT NULL DEFAULT 0,
+			episode_number INTEGER NOT NULL DEFAULT 0,
+			torrent_hash TEXT NOT NULL,
+			file_index INTEGER NOT NULL DEFAULT -1,
+			intro_start REAL,
+			intro_end REAL,
+			credits_start REAL,
+			credits_end REAL,
+			source TEXT NOT NULL DEFAULT 'chapter',
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(imdb_id, season_number, episode_number, torrent_hash, file_index)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_skip_segments_lookup 
+		ON media_skip_segments (imdb_id, season_number, episode_number, torrent_hash, file_index);`,
 	}
 
 	for _, q := range queries {

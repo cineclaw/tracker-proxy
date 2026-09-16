@@ -78,8 +78,9 @@ type PlayerInfoResponse struct {
 	Bitrate           int64               `json:"bitrate,omitempty"`
 	VideoCodec        string              `json:"video_codec,omitempty"`
 	TargetFileIdx      int                 `json:"target_file_idx"`
-	TranscodeProfiles  []transcode.Profile `json:"transcode_profiles,omitempty"`
-	TranscodeStreamURL string              `json:"transcode_stream_url,omitempty"`
+	TranscodeProfiles  []transcode.Profile    `json:"transcode_profiles,omitempty"`
+	TranscodeStreamURL string                 `json:"transcode_stream_url,omitempty"`
+	SkipSegments       []playback.SkipSegment `json:"skip_segments,omitempty"`
 }
 
 type StreamStatsResponse struct {
@@ -241,6 +242,7 @@ type TorrStreamService struct {
 	mu              sync.RWMutex
 	mountedTorrents map[string]*MountedTorrentInfo
 	probeCache      map[string]*ProbeInfo
+	chapterCache    map[string][]ChapterMarker
 
 	metaMu    sync.RWMutex
 	metaCache map[string]*IndexerMeta
@@ -352,6 +354,7 @@ func NewTorrStreamService(
 		torrServerURL:   torrURL,
 		mountedTorrents: make(map[string]*MountedTorrentInfo),
 		probeCache:      make(map[string]*ProbeInfo),
+		chapterCache:    make(map[string][]ChapterMarker),
 		metaCache:       make(map[string]*IndexerMeta),
 	}
 }
@@ -502,6 +505,71 @@ func (s *TorrStreamService) probeStream(ctx context.Context, hash string, fileId
 	s.mu.Unlock()
 
 	return info
+}
+
+func (s *TorrStreamService) probeChapters(ctx context.Context, hash string, fileId int) []ChapterMarker {
+	cacheKey := fmt.Sprintf("%s:%d", hash, fileId)
+	s.mu.RLock()
+	if s.chapterCache != nil {
+		if cached, ok := s.chapterCache[cacheKey]; ok {
+			s.mu.RUnlock()
+			return cached
+		}
+	}
+	s.mu.RUnlock()
+
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return nil
+	}
+
+	torrURL := fmt.Sprintf("%s/stream?link=%s&index=%d", s.torrServerURL, hash, fileId)
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(probeCtx, ffprobePath,
+		"-v", "error",
+		"-show_chapters",
+		"-of", "json",
+		torrURL,
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var data struct {
+		Chapters []struct {
+			StartTime string            `json:"start_time"`
+			EndTime   string            `json:"end_time"`
+			Tags      map[string]string `json:"tags"`
+		} `json:"chapters"`
+	}
+	if err := json.Unmarshal(out, &data); err != nil || len(data.Chapters) == 0 {
+		return nil
+	}
+
+	var markers []ChapterMarker
+	for _, ch := range data.Chapters {
+		start, _ := strconv.ParseFloat(ch.StartTime, 64)
+		end, _ := strconv.ParseFloat(ch.EndTime, 64)
+		title := ch.Tags["title"]
+		markers = append(markers, ChapterMarker{
+			Title:     title,
+			StartTime: start,
+			EndTime:   end,
+		})
+	}
+
+	s.mu.Lock()
+	if s.chapterCache == nil {
+		s.chapterCache = make(map[string][]ChapterMarker)
+	}
+	s.chapterCache[cacheKey] = markers
+	s.mu.Unlock()
+
+	return markers
 }
 
 func (s *TorrStreamService) GetServiceURLs() (string, string, string) {
@@ -1709,30 +1777,64 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		durationSeconds = float64(probe.DurationNS) / 1e9
 	}
 
+	// Resolve Intro & Credits Skip Segments
+	var skipSegments []playback.SkipSegment
+	if s.playbackStore != nil && hash != "" {
+		skipSegments, _ = s.playbackStore.GetSkipSegments(tconst, season, episode, hash, targetFileIdx)
+	}
+
+	if len(skipSegments) == 0 && hash != "" && targetFileIdx > 0 {
+		// Fast probe attempt (up to 1500ms)
+		probeChCtx, probeChCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		chapters := s.probeChapters(probeChCtx, hash, targetFileIdx)
+		probeChCancel()
+
+		if len(chapters) > 0 {
+			skipSegments = ClassifyChaptersToSkipSegments(chapters, durationSeconds, season > 0)
+			if len(skipSegments) > 0 && s.playbackStore != nil {
+				_ = s.playbackStore.SaveSkipSegments(tconst, season, episode, hash, targetFileIdx, skipSegments, "chapter")
+			}
+		} else {
+			// Trigger background probe so subsequent requests have skip segments
+			go func() {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer bgCancel()
+				bgChapters := s.probeChapters(bgCtx, hash, targetFileIdx)
+				if len(bgChapters) > 0 {
+					bgSegs := ClassifyChaptersToSkipSegments(bgChapters, durationSeconds, season > 0)
+					if len(bgSegs) > 0 && s.playbackStore != nil {
+						_ = s.playbackStore.SaveSkipSegments(tconst, season, episode, hash, targetFileIdx, bgSegs, "chapter")
+					}
+				}
+			}()
+		}
+	}
+
 	return &PlayerInfoResponse{
-		Success:         true,
-		ItemId:          fmt.Sprintf("%s_s%d_e%d", tconst, season, episode),
-		Title:           title,
-		MediaType:       mediaType,
-		DurationSeconds: durationSeconds,
-		ResumeSeconds:   resumeSec,
-		IsPlayed:        isPlayed,
-		StreamURL:       streamURL,
-		DirectStreamURL: directStreamURL,
-		MediaSourceId:   hash,
-		AudioTracks:     audioTracks,
-		Subtitles:       subtitleTracks,
-		Episodes:        episodesList,
-		CurrentSeason:   season,
-		CurrentEpisode:  episode,
-		HasNextEpisode:  hasNextEpisode,
-		NextEpisode:     nextEpisode,
-		Width:             videoWidth,
-		Height:            videoHeight,
+		Success:            true,
+		ItemId:             fmt.Sprintf("%s_s%d_e%d", tconst, season, episode),
+		Title:              title,
+		MediaType:          mediaType,
+		DurationSeconds:    durationSeconds,
+		ResumeSeconds:      resumeSec,
+		IsPlayed:           isPlayed,
+		StreamURL:          streamURL,
+		DirectStreamURL:    directStreamURL,
+		MediaSourceId:      hash,
+		AudioTracks:        audioTracks,
+		Subtitles:          subtitleTracks,
+		Episodes:           episodesList,
+		CurrentSeason:      season,
+		CurrentEpisode:     episode,
+		HasNextEpisode:     hasNextEpisode,
+		NextEpisode:        nextEpisode,
+		Width:              videoWidth,
+		Height:             videoHeight,
 		VideoCodec:         videoCodec,
 		TargetFileIdx:      targetFileIdx,
 		TranscodeProfiles:  transcode.AvailableProfiles(),
 		TranscodeStreamURL: fmt.Sprintf("/api/stream/transcode/%s/master.m3u8?profile=1080p&file_idx=%d&audio=%d&duration=%.2f", hash, targetFileIdx, defaultAudioIdx, durationSeconds),
+		SkipSegments:       skipSegments,
 	}, nil
 }
 
