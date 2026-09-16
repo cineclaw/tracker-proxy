@@ -212,3 +212,14 @@ func Load(path string) (*Config, error) {
 
 	return cfg, nil
 }
+
+func (c *Config) Save(path string) error {
+	if path == "" {
+		path = "config.yaml"
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}

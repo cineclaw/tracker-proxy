@@ -153,7 +153,7 @@ func main() {
 
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc, transcodeEng, homeSvc)
+	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc, transcodeEng, homeSvc, cfg, configPath)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)

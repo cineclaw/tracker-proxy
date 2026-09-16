@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"tracker-proxy/config"
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
@@ -25,6 +26,7 @@ import (
 	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
+	"tracker-proxy/pkg/tracker/rutracker"
 	"tracker-proxy/pkg/transcode"
 	"tracker-proxy/pkg/version"
 )
@@ -39,6 +41,8 @@ type Handler struct {
 	hotlist    *hotlist.Service
 	home       *home.Service
 	transcode  *transcode.TranscodeEngine
+	cfg        *config.Config
+	configPath string
 	sf         singleflight.Group
 }
 
@@ -52,6 +56,8 @@ func NewHandler(
 	nextUpSvc *playback.NextUpService,
 	transcodeEng *transcode.TranscodeEngine,
 	homeSvc *home.Service,
+	cfg *config.Config,
+	configPath string,
 ) *Handler {
 	return &Handler{
 		aggregator: agg,
@@ -63,6 +69,8 @@ func NewHandler(
 		hotlist:    hotlistSvc,
 		home:       homeSvc,
 		transcode:  transcodeEng,
+		cfg:        cfg,
+		configPath: configPath,
 	}
 }
 
@@ -72,6 +80,15 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stream/health", h.handleHealth)
 	mux.HandleFunc("/api/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
 	mux.HandleFunc("/torrents/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
+
+	// Trackers Management & Cookie API
+	mux.HandleFunc("/api/trackers/status", h.corsMiddleware(h.handleTrackersStatus))
+	mux.HandleFunc("/torrents/trackers/status", h.corsMiddleware(h.handleTrackersStatus))
+	mux.HandleFunc("/api/trackers/rutracker/cookie", h.corsMiddleware(h.handleUpdateRuTrackerCookie))
+	mux.HandleFunc("/torrents/trackers/rutracker/cookie", h.corsMiddleware(h.handleUpdateRuTrackerCookie))
+	mux.HandleFunc("/api/trackers/rutracker/test", h.corsMiddleware(h.handleTestRuTracker))
+	mux.HandleFunc("/torrents/trackers/rutracker/test", h.corsMiddleware(h.handleTestRuTracker))
+
 
 	mux.HandleFunc("/api/search", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/api/torrents", h.corsMiddleware(h.handleJSONSearch))
@@ -1752,5 +1769,184 @@ func (h *Handler) handleTranscodePlaylist(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(vodPlaylist))
 }
+
+type UpdateCookieRequest struct {
+	Cookie    string `json:"cookie"`
+	UserAgent string `json:"user_agent"`
+}
+
+type TrackerStatusItem struct {
+	Name           string `json:"name"`
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"base_url"`
+	Username       string `json:"username,omitempty"`
+	Status         string `json:"status"` // "online", "challenge_required", "disabled", "error"
+	HasCookie      bool   `json:"has_cookie"`
+	HasCfClearance bool   `json:"has_cf_clearance"`
+	HasSession     bool   `json:"has_session"`
+	UserAgent      string `json:"user_agent,omitempty"`
+	MaskedCookie   string `json:"masked_cookie,omitempty"`
+}
+
+type TrackersStatusResponse struct {
+	RuTor     TrackerStatusItem `json:"rutor"`
+	NNMClub   TrackerStatusItem `json:"nnmclub"`
+	RuTracker TrackerStatusItem `json:"rutracker"`
+}
+
+func (h *Handler) handleTrackersStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	nnmUser := ""
+	if h.cfg != nil {
+		nnmUser = h.cfg.Trackers.NNMClub.Username
+	}
+
+	rutrackerUser := ""
+	if h.cfg != nil {
+		rutrackerUser = h.cfg.Trackers.RuTracker.Username
+	}
+
+	resp := TrackersStatusResponse{
+		RuTor: TrackerStatusItem{
+			Name:    "rutor",
+			Enabled: true,
+			BaseURL: "https://rutor.info",
+			Status:  "online",
+		},
+		NNMClub: TrackerStatusItem{
+			Name:     "nnmclub",
+			Enabled:  true,
+			BaseURL:  "https://nnmclub.to",
+			Username: nnmUser,
+			Status:   "online",
+		},
+		RuTracker: TrackerStatusItem{
+			Name:     "rutracker",
+			Enabled:  true,
+			BaseURL:  "https://rutracker.org",
+			Username: rutrackerUser,
+			Status:   "challenge_required",
+		},
+	}
+
+	if rt := h.aggregator.GetTracker("rutracker"); rt != nil {
+		if rtt, ok := rt.(*rutracker.Tracker); ok {
+			st := rtt.GetStatus()
+			resp.RuTracker.Enabled = st.Enabled
+			resp.RuTracker.BaseURL = st.BaseURL
+			if st.Username != "" {
+				resp.RuTracker.Username = st.Username
+			}
+			resp.RuTracker.HasCookie = st.HasCookie
+			resp.RuTracker.HasCfClearance = st.HasCfClearance
+			resp.RuTracker.HasSession = st.HasSession
+			resp.RuTracker.UserAgent = st.UserAgent
+			resp.RuTracker.MaskedCookie = st.MaskedCookie
+			if st.HasCookie && st.HasCfClearance {
+				resp.RuTracker.Status = "online"
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleUpdateRuTrackerCookie(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req UpdateCookieRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	req.Cookie = strings.TrimSpace(req.Cookie)
+	req.UserAgent = strings.TrimSpace(req.UserAgent)
+
+	rt := h.aggregator.GetTracker("rutracker")
+	if rt == nil {
+		http.Error(w, "rutracker tracker not loaded", http.StatusNotFound)
+		return
+	}
+
+	rtt, ok := rt.(*rutracker.Tracker)
+	if !ok {
+		http.Error(w, "invalid rutracker instance", http.StatusInternalServerError)
+		return
+	}
+
+	// 1. Update in memory
+	rtt.UpdateCookieAndUserAgent(req.Cookie, req.UserAgent)
+
+	// 2. Persist to config.yaml if available
+	if h.cfg != nil {
+		h.cfg.Trackers.RuTracker.Cookie = req.Cookie
+		if req.UserAgent != "" {
+			h.cfg.Trackers.RuTracker.UserAgent = req.UserAgent
+		}
+		if err := h.cfg.Save(h.configPath); err != nil {
+			log.Printf("[trackers] Warning: failed to save updated config to %s: %v", h.configPath, err)
+		} else {
+			log.Printf("[trackers] Saved updated RuTracker cookies to %s", h.configPath)
+		}
+	}
+
+	// 3. Perform test connection
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	statusCode, testMsg, err := rtt.TestConnection(ctx)
+	isOk := err == nil && statusCode == http.StatusOK && !strings.Contains(testMsg, "Challenge")
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":          isOk,
+		"status_code": statusCode,
+		"message":     testMsg,
+		"status":      rtt.GetStatus(),
+	})
+}
+
+func (h *Handler) handleTestRuTracker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rt := h.aggregator.GetTracker("rutracker")
+	if rt == nil {
+		http.Error(w, "rutracker tracker not loaded", http.StatusNotFound)
+		return
+	}
+
+	rtt, ok := rt.(*rutracker.Tracker)
+	if !ok {
+		http.Error(w, "invalid rutracker instance", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	statusCode, testMsg, err := rtt.TestConnection(ctx)
+	isOk := err == nil && statusCode == http.StatusOK && !strings.Contains(testMsg, "Challenge")
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":          isOk,
+		"status_code": statusCode,
+		"message":     testMsg,
+		"status":      rtt.GetStatus(),
+	})
+}
+
 
 

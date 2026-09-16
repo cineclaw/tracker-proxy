@@ -43,6 +43,22 @@ func (a *Aggregator) SetCache(cs *cache.Store) {
 	a.cacheStore = cs
 }
 
+// GetTrackers returns all loaded tracker instances.
+func (a *Aggregator) GetTrackers() []tracker.Tracker {
+	return a.trackers
+}
+
+// GetTracker finds a specific tracker by name (e.g. "rutracker").
+func (a *Aggregator) GetTracker(name string) tracker.Tracker {
+	for _, tr := range a.trackers {
+		if strings.EqualFold(tr.Name(), name) {
+			return tr
+		}
+	}
+	return nil
+}
+
+
 func (a *Aggregator) Search(ctx context.Context, query models.SearchQuery) []models.TorrentResult {
 	if strings.TrimSpace(query.Query) == "" {
 		log.Printf("[aggregator] Search called with empty query for imdb=%q; aborting search to prevent tracker homepage dumps", query.IMDbID)

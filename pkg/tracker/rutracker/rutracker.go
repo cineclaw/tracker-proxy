@@ -144,6 +144,125 @@ func (t *Tracker) SetEnabled(enabled bool) {
 	t.enabled = enabled
 }
 
+type RuTrackerStatus struct {
+	Name           string `json:"name"`
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"base_url"`
+	Username       string `json:"username"`
+	HasCookie      bool   `json:"has_cookie"`
+	HasCfClearance bool   `json:"has_cf_clearance"`
+	HasSession     bool   `json:"has_session"`
+	UserAgent      string `json:"user_agent"`
+	MaskedCookie   string `json:"masked_cookie"`
+}
+
+func (t *Tracker) GetStatus() RuTrackerStatus {
+	t.stateMu.RLock()
+	defer t.stateMu.RUnlock()
+
+	masked := ""
+	if t.cookie != "" {
+		parts := strings.Split(t.cookie, ";")
+		var maskedParts []string
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 {
+				k := strings.TrimSpace(kv[0])
+				v := strings.TrimSpace(kv[1])
+				if len(v) > 8 {
+					maskedParts = append(maskedParts, fmt.Sprintf("%s=%s...%s", k, v[:4], v[len(v)-4:]))
+				} else {
+					maskedParts = append(maskedParts, fmt.Sprintf("%s=***", k))
+				}
+			}
+		}
+		masked = strings.Join(maskedParts, "; ")
+	}
+
+	return RuTrackerStatus{
+		Name:           t.Name(),
+		Enabled:        t.enabled,
+		BaseURL:        t.baseURL,
+		Username:       t.username,
+		HasCookie:      t.cookie != "",
+		HasCfClearance: strings.Contains(t.cookie, "cf_clearance"),
+		HasSession:     strings.Contains(t.cookie, "bb_session"),
+		UserAgent:      t.userAgent,
+		MaskedCookie:   masked,
+	}
+}
+
+func (t *Tracker) UpdateCookieAndUserAgent(rawCookie, userAgent string) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+
+	t.cookie = strings.TrimSpace(rawCookie)
+	if strings.TrimSpace(userAgent) != "" {
+		t.userAgent = strings.TrimSpace(userAgent)
+	}
+
+	jar, _ := cookiejar.New(nil)
+	t.jar = jar
+	t.client.Jar = jar
+
+	if t.cookie != "" {
+		t.applyRawCookie(t.cookie)
+	}
+	t.lastLogin = time.Time{}
+	t.lastSolved = time.Now()
+}
+
+func (t *Tracker) TestConnection(ctx context.Context) (int, string, error) {
+	testURL := fmt.Sprintf("%s/forum/tracker.php?nm=test", t.baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
+	if err != nil {
+		return 0, "", err
+	}
+
+	t.stateMu.RLock()
+	ua := t.userAgent
+	cookie := t.cookie
+	t.stateMu.RUnlock()
+
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "ru,en;q=0.9")
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+
+	client := &http.Client{
+		Jar:     t.jar,
+		Timeout: 7 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		return resp.StatusCode, "Cloudflare 403 Forbidden (требуется свежий cf_clearance)", nil
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		doc, err := goquery.NewDocumentFromReader(resp.Body)
+		if err == nil {
+			title := doc.Find("title").Text()
+			if strings.Contains(strings.ToLower(title), "just a moment") {
+				return http.StatusForbidden, "Cloudflare Turnstile Challenge (капча не пройдена)", nil
+			}
+			return resp.StatusCode, fmt.Sprintf("Успешно подключено! (%s)", strings.TrimSpace(title)), nil
+		}
+		return resp.StatusCode, "Успешно подключено! (200 OK)", nil
+	}
+
+	return resp.StatusCode, fmt.Sprintf("HTTP %d", resp.StatusCode), nil
+}
+
+
 func (t *Tracker) EnsureClearance(ctx context.Context) error {
 	if t.flaresolverrClient == nil {
 		return fmt.Errorf("flaresolverr client not configured")
@@ -354,16 +473,17 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 			break
 		}
 
-		// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution
+		// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution with short timeout
 		if resp.StatusCode == http.StatusForbidden && t.flaresolverrClient != nil {
 			resp.Body.Close()
 			log.Printf("[rutracker] Received HTTP 403 Forbidden; acquiring Cloudflare clearance via FlareSolverr...")
 
-			solveCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+			solveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			if solveErr := t.EnsureClearance(solveCtx); solveErr != nil {
 				cancel()
+				log.Printf("[rutracker] FlareSolverr challenge attempt failed/skipped (%v); RuTracker needs cookie", solveErr)
 				if page == 0 {
-					return nil, fmt.Errorf("failed to solve cloudflare challenge: %w", solveErr)
+					return nil, fmt.Errorf("rutracker 403 (cookie required): %w", solveErr)
 				}
 				break
 			}
@@ -371,7 +491,7 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 
 			// Retry login if credentials exist and bb_session was not provided
 			if t.username != "" && t.password != "" && !strings.Contains(t.cookie, "bb_session") {
-				solveCtx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+				solveCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
 				_ = t.Login(solveCtx2)
 				cancel2()
 			}
