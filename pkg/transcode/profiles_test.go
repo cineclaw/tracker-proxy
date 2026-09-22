@@ -22,7 +22,7 @@ func TestAvailableProfiles(t *testing.T) {
 	}
 
 	p720 := GetProfile("720p")
-	if p720.MaxHeight != 720 || p720.BitrateKbps != 2800 {
+	if p720.MaxHeight != 720 || p720.BitrateKbps != 5000 {
 		t.Errorf("unexpected 720p profile: %+v", p720)
 	}
 
@@ -63,8 +63,14 @@ func TestBuildFFmpegArgs(t *testing.T) {
 	if !strings.Contains(cmdStr, "scale=w=-2:h=min(720\\,ih)") {
 		t.Errorf("missing scale filter: %s", cmdStr)
 	}
-	if !strings.Contains(cmdStr, "-b:v 2800k") {
+	if !strings.Contains(cmdStr, "-b:v 5000k") {
 		t.Errorf("missing bitrate: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-profile:v high") {
+		t.Errorf("missing high profile: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-tune film") {
+		t.Errorf("missing film tuning: %s", cmdStr)
 	}
 	if !strings.Contains(cmdStr, "-f hls") {
 		t.Errorf("missing hls format: %s", cmdStr)
