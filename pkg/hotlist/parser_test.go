@@ -89,6 +89,14 @@ func TestParseReleaseTitle(t *testing.T) {
 			wantYear:      2008,
 			wantQualityIn: "720P",
 		},
+		{
+			name:          "Nu Pogodi Cyrillic x",
+			raw:           "Ну, погоди! Каникулы [04х01-24 из 26] (2025) WEB-DLRip",
+			wantRu:        "Ну, погоди! Каникулы",
+			wantOrig:      "Ну, погоди! Каникулы",
+			wantYear:      2025,
+			wantQualityIn: "WEB-DLRIP",
+		},
 	}
 
 	for _, tt := range tests {

@@ -177,6 +177,47 @@ func (s *Scraper) ScrapeUHD(ctx context.Context, mediaType string, limit int) ([
 	return s.scrapeUrlsConcurrently(ctx, urls, mType, limit)
 }
 
+// ScrapeFreshKids fetches latest kids/cartoons releases sorted by date descending from RuTor category 7
+func (s *Scraper) ScrapeFreshKids(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	// Category 7 = Мультипликация (Cartoons & Animation)
+	for page := 0; page < 5; page++ {
+		urls = append(urls, fmt.Sprintf("%s/browse/%d/7/0/0", s.baseURL, page))
+	}
+
+	torrents, err := s.scrapeUrlsConcurrently(ctx, urls, "movie", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter for recent animation releases (Year >= 2024)
+	minYear := 2024
+	var fresh []RawTorrent
+	for _, t := range torrents {
+		if t.Year >= minYear {
+			fresh = append(fresh, t)
+		}
+	}
+
+	sort.Slice(fresh, func(i, j int) bool {
+		return fresh[i].PublishDate.After(fresh[j].PublishDate)
+	})
+
+	if limit > 0 && len(fresh) > limit {
+		fresh = fresh[:limit]
+	}
+	return fresh, nil
+}
+
+// ScrapeTopKids fetches top-seeded kids/cartoons releases from RuTor category 7
+func (s *Scraper) ScrapeTopKids(ctx context.Context, limit int) ([]RawTorrent, error) {
+	var urls []string
+	// Category 7 = Мультипликация, sorted by seeds
+	for page := 0; page < 10; page++ {
+		urls = append(urls, fmt.Sprintf("%s/browse/%d/7/0/2", s.baseURL, page))
+	}
+	return s.scrapeUrlsConcurrently(ctx, urls, "movie", limit)
+}
 
 func (s *Scraper) scrapeUrlsConcurrently(ctx context.Context, urls []string, mediaType string, limit int) ([]RawTorrent, error) {
 	type pageResult struct {

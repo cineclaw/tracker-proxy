@@ -59,8 +59,22 @@ func NewService(scraper *Scraper, matcher *Matcher, db *bbolt.DB, ttl time.Durat
 	s.loadFromDB("tv")
 	s.loadFromDB("new_movie")
 	s.loadFromDB("new_tv")
+	s.loadFromDB("new_kids")
+	s.loadFromDB("kids_popular")
 	s.loadFromDB("anime")
 	s.loadFromDB("doc")
+
+	// Trigger initial background pre-fetch for any empty categories so cache is always warm
+	go func() {
+		for _, cat := range []string{"movie", "tv", "new_movie", "new_tv", "new_kids", "kids_popular", "anime", "doc"} {
+			s.mu.RLock()
+			cached, ok := s.memCache[cat]
+			s.mu.RUnlock()
+			if !ok || len(cached.Items) == 0 {
+				s.triggerRefresh(cat)
+			}
+		}
+	}()
 
 	// Start periodic background refresher every 2 hours
 	go s.backgroundRefresher()
@@ -84,6 +98,14 @@ func (s *Service) GetHotlist(ctx context.Context, mediaType, quality string, pag
 		validType = "new_tv"
 		shelfID = "tracker_fresh"
 		shelfTitle = "Новинки сериалов на трекерах"
+	case "new_kids", "kids_fresh", "kids_new":
+		validType = "new_kids"
+		shelfID = "tracker_fresh_kids"
+		shelfTitle = "Новинки на трекерах для детей"
+	case "kids_popular", "kids_cartoons", "kids_top":
+		validType = "kids_popular"
+		shelfID = "tracker_hotlist_kids"
+		shelfTitle = "Популярно на трекерах (Мультфильмы)"
 	case "anime":
 		validType = "anime"
 		shelfID = "anime_hub"
@@ -171,26 +193,43 @@ func (s *Service) getItems(ctx context.Context, mediaType string, forceRefresh b
 	cached, found := s.memCache[mediaType]
 	s.mu.RUnlock()
 
-	// Check if cached items are corrupt (all lack tconst and poster) or contain legacy /poster/ paths
+	// Check if cached items are corrupt or have unacceptable poster missing rate
 	isCorrupt := false
 	if found && len(cached.Items) > 0 {
-		hasValid := false
-		for _, it := range cached.Items {
+		missingPosterCount := 0
+		checkCount := len(cached.Items)
+		if checkCount > 20 {
+			checkCount = 20
+		}
+		for i := 0; i < checkCount; i++ {
+			it := cached.Items[i]
 			if strings.HasPrefix(it.PosterPath, "/poster/") {
 				isCorrupt = true
 				break
 			}
-			if it.Tconst != "" || it.PosterPath != "" {
-				hasValid = true
+			if it.PosterPath == "" && it.Tconst == "" {
+				missingPosterCount++
 			}
 		}
-		if !hasValid {
+		if float64(missingPosterCount)/float64(checkCount) > 0.35 {
 			isCorrupt = true
 		}
 	}
 
 	if forceRefresh || isCorrupt {
-		s.fetchAndSave(ctx, mediaType)
+		// Trigger background refresh with independent context
+		go s.triggerRefresh(mediaType)
+
+		// If we already have items (even if partial), return them now so we don't block caller
+		if found && len(cached.Items) > 0 && !forceRefresh {
+			return cached.Items
+		}
+
+		// If forced refresh or completely empty, wait with a dedicated 5-minute timeout
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		s.fetchAndSave(bgCtx, mediaType)
+		cancel()
+
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		return s.memCache[mediaType].Items
@@ -208,8 +247,10 @@ func (s *Service) getItems(ctx context.Context, mediaType string, forceRefresh b
 		return cached.Items
 	}
 
-	// If completely empty, wait synchronously for first fetch
-	s.fetchAndSave(ctx, mediaType)
+	// If completely empty, wait synchronously for first fetch with dedicated background context
+	bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	s.fetchAndSave(bgCtx, mediaType)
+	cancel()
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -237,8 +278,24 @@ func (s *Service) triggerRefresh(mediaType string) {
 	s.fetchAndSave(ctx, mediaType)
 }
 
+func isKidsContentSafe(it Item) bool {
+	titleLower := strings.ToLower(it.Title + " " + it.OriginalTitle + " " + it.Overview)
+	for _, badWord := range []string{"18+", "хентай", "hentai", "эротика", "ужасы", "порно", "расчлененка", "эротич"} {
+		if strings.Contains(titleLower, badWord) {
+			return false
+		}
+	}
+	for _, g := range it.Genres {
+		gl := strings.ToLower(g)
+		if gl == "horror" || gl == "erotica" {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
-	log.Printf("[hotlist] Fetching 10 pages per category from RuTor for %s...", mediaType)
+	log.Printf("[hotlist] Fetching releases from RuTor for %s...", mediaType)
 	var raw []RawTorrent
 	var err error
 	matchingMediaType := mediaType
@@ -252,12 +309,18 @@ func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
 	case "new_tv":
 		raw, err = s.scraper.ScrapeFreshSeries(ctx, 0)
 		matchingMediaType = "new_tv"
+	case "new_kids":
+		raw, err = s.scraper.ScrapeFreshKids(ctx, 0)
+		matchingMediaType = "new_kids"
+	case "kids_popular":
+		raw, err = s.scraper.ScrapeTopKids(ctx, 0)
+		matchingMediaType = "kids_popular"
 	case "anime":
 		raw, err = s.scraper.ScrapeAnime(ctx, 0)
-		matchingMediaType = "tv"
+		matchingMediaType = "anime"
 	case "doc":
 		raw, err = s.scraper.ScrapeDocumentaries(ctx, 0)
-		matchingMediaType = "movie"
+		matchingMediaType = "doc"
 	default:
 		raw, err = s.scraper.ScrapeMovies(ctx, 0)
 		matchingMediaType = "movie"
@@ -270,6 +333,24 @@ func (s *Service) fetchAndSave(ctx context.Context, mediaType string) {
 
 	log.Printf("[hotlist] Scraped %d raw releases for %s. Matching against Tantivy...", len(raw), mediaType)
 	items := s.matcher.MatchAndGroup(ctx, raw, matchingMediaType)
+
+	// If cancelled by context, do not save half-baked results to cache/db
+	if ctx.Err() != nil {
+		log.Printf("[hotlist] Matching %s aborted by context: %v. Discarding incomplete results.", mediaType, ctx.Err())
+		return
+	}
+
+	// Content safety filter for kids feeds
+	if mediaType == "new_kids" || mediaType == "kids_popular" {
+		var kidsClean []Item
+		for _, it := range items {
+			if isKidsContentSafe(it) {
+				kidsClean = append(kidsClean, it)
+			}
+		}
+		items = kidsClean
+	}
+
 	log.Printf("[hotlist] Grouped into %d unique items for %s", len(items), mediaType)
 
 	data := CachedData{
@@ -321,13 +402,22 @@ func (s *Service) loadFromDB(mediaType string) {
 		}
 		var data CachedData
 		if err := json.Unmarshal(val, &data); err == nil {
-			// Validate that restored items have valid matches and do not contain legacy /poster/ endpoints
+			// Validate that restored items have valid matches and do not have unacceptable missing poster rate
 			hasValid := false
 			hasLegacy := false
-			for _, it := range data.Items {
+			missingPosterCount := 0
+			checkCount := len(data.Items)
+			if checkCount > 20 {
+				checkCount = 20
+			}
+			for i := 0; i < checkCount; i++ {
+				it := data.Items[i]
 				if strings.HasPrefix(it.PosterPath, "/poster/") {
 					hasLegacy = true
 					break
+				}
+				if it.PosterPath == "" && it.Tconst == "" {
+					missingPosterCount++
 				}
 				if it.Tconst != "" || it.PosterPath != "" {
 					hasValid = true
@@ -337,8 +427,8 @@ func (s *Service) loadFromDB(mediaType string) {
 				log.Printf("[hotlist] Discarding legacy /poster/ cached %s hotlist items from bbolt", mediaType)
 				return nil
 			}
-			if len(data.Items) > 0 && !hasValid {
-				log.Printf("[hotlist] Discarding corrupt cached %s hotlist items from bbolt (no tconst or poster matched)", mediaType)
+			if len(data.Items) > 0 && (!hasValid || float64(missingPosterCount)/float64(checkCount) > 0.35) {
+				log.Printf("[hotlist] Discarding corrupt cached %s hotlist items from bbolt (missing posters: %d/%d)", mediaType, missingPosterCount, checkCount)
 				return nil
 			}
 
@@ -356,12 +446,14 @@ func (s *Service) backgroundRefresher() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		log.Printf("[hotlist] Periodic background refresh triggered for movie, tv, new_movie, new_tv, anime, doc...")
+		log.Printf("[hotlist] Periodic background refresh triggered for movie, tv, new_movie, new_tv, new_kids, kids_popular, anime, doc...")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		s.fetchAndSave(ctx, "movie")
 		s.fetchAndSave(ctx, "tv")
 		s.fetchAndSave(ctx, "new_movie")
 		s.fetchAndSave(ctx, "new_tv")
+		s.fetchAndSave(ctx, "new_kids")
+		s.fetchAndSave(ctx, "kids_popular")
 		s.fetchAndSave(ctx, "anime")
 		s.fetchAndSave(ctx, "doc")
 		cancel()

@@ -149,3 +149,38 @@ func (a *Aggregator) ResolveInfoHash(ctx context.Context, trackerName, id string
 	return clean, nil
 }
 
+// ResolveInfoHashFresh forces a live fetch from the tracker, bypassing and updating the bbolt cache.
+func (a *Aggregator) ResolveInfoHashFresh(ctx context.Context, trackerName, id string) (string, error) {
+	if trackerName == "" || id == "" {
+		return "", nil
+	}
+
+	if a.cacheStore != nil {
+		_ = a.cacheStore.DeleteTopicHash(trackerName, id)
+	}
+
+	resolver, ok := a.resolvers[strings.ToLower(trackerName)]
+	if !ok {
+		return "", nil
+	}
+
+	hash, err := resolver.FetchInfoHash(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	clean := strings.ToLower(strings.TrimSpace(hash))
+	if clean != "" && a.cacheStore != nil {
+		_ = a.cacheStore.SetTopicHash(trackerName, id, clean)
+	}
+
+	return clean, nil
+}
+
+// InvalidateTopicHash removes the cached topic hash from bbolt cache.
+func (a *Aggregator) InvalidateTopicHash(trackerName, id string) {
+	if a.cacheStore != nil && trackerName != "" && id != "" {
+		_ = a.cacheStore.DeleteTopicHash(trackerName, id)
+	}
+}
+

@@ -265,6 +265,13 @@ func (s *TorrStreamService) FetchIndexerMeta(ctx context.Context, tconst string)
 	return s.fetchIndexerMeta(ctx, tconst)
 }
 
+func (s *TorrStreamService) TorrClient() *TorrClient {
+	if s == nil {
+		return nil
+	}
+	return s.torrClient
+}
+
 func isRawTorrentTitle(t string) bool {
 	if strings.TrimSpace(t) == "" {
 		return true
@@ -1105,9 +1112,8 @@ func FilterCandidates(candidates []models.TorrentResult, meta *IndexerMeta, seas
 	return valid
 }
 
-// autoResolveTorrent finds and resolves the best available torrent for a title/season
-func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst string, season int) (*models.TorrentResult, error) {
-	log.Printf("[stream] autoResolveTorrent: looking up torrent for tconst=%q season=%d", tconst, season)
+func (s *TorrStreamService) resolveCandidatePool(ctx context.Context, tconst string, season int, bypassCache bool) ([]models.TorrentResult, *IndexerMeta, error) {
+	log.Printf("[stream] resolveCandidatePool: looking up torrents for tconst=%q season=%d bypassCache=%t", tconst, season, bypassCache)
 	var candidates []models.TorrentResult
 
 	normIMDb := cache.NormalizeIMDbID(tconst)
@@ -1116,7 +1122,11 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 		meta = s.fetchIndexerMeta(ctx, normIMDb)
 	}
 
-	if normIMDb != "" && s.cacheStore != nil {
+	if bypassCache && s.cacheStore != nil && normIMDb != "" {
+		_ = s.cacheStore.Delete(normIMDb)
+	}
+
+	if !bypassCache && normIMDb != "" && s.cacheStore != nil {
 		if cached, found, err := s.cacheStore.Get(normIMDb); err == nil && found && len(cached) > 0 {
 			candidates = cached
 		}
@@ -1142,7 +1152,7 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 			}
 		}
 		if queryStr == "" {
-			return nil, fmt.Errorf("unable to resolve title for %s to search torrents", normIMDb)
+			return nil, nil, fmt.Errorf("unable to resolve title for %s to search torrents", normIMDb)
 		}
 
 		res := s.aggregator.Search(ctx, models.SearchQuery{
@@ -1168,7 +1178,7 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 	}
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no torrents found for %s", tconst)
+		return nil, nil, fmt.Errorf("no torrents found for %s", tconst)
 	}
 
 	for i := range candidates {
@@ -1231,7 +1241,7 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 			}
 		}
 		if len(pool) == 0 {
-			return nil, fmt.Errorf("сезон %d не найден среди доступных раздач", season)
+			return nil, nil, fmt.Errorf("сезон %d не найден среди доступных раздач", season)
 		}
 	} else {
 		pool = candidates
@@ -1247,12 +1257,22 @@ func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst strin
 	}
 	pool = FilterCandidates(pool, meta, season, targetMediaType, targetYear)
 	if len(pool) == 0 {
-		return nil, fmt.Errorf("нет подходящих раздач для %s (год/название не совпали)", tconst)
+		return nil, nil, fmt.Errorf("нет подходящих раздач для %s (год/название не совпали)", tconst)
 	}
 
 	sort.Slice(pool, func(i, j int) bool {
 		return ScoreCandidate(&pool[i], meta, season) > ScoreCandidate(&pool[j], meta, season)
 	})
+
+	return pool, meta, nil
+}
+
+// autoResolveTorrent finds and resolves the best available torrent for a title/season
+func (s *TorrStreamService) autoResolveTorrent(ctx context.Context, tconst string, season int) (*models.TorrentResult, error) {
+	pool, _, err := s.resolveCandidatePool(ctx, tconst, season, false)
+	if err != nil {
+		return nil, err
+	}
 
 	chosen := pool[0]
 
@@ -1525,38 +1545,71 @@ func (s *TorrStreamService) GetPlayerInfo(ctx context.Context, tconst string, se
 		} else if season > 0 {
 			log.Printf("[stream] Episode S%02dE%02d not found in current torrent %s: %v. Attempting auto-resolve for season %d...",
 				season, episode, hash, matchErr, season)
-			bestTorrent, autoErr := s.autoResolveTorrent(ctx, tconst, season)
-			if autoErr == nil && bestTorrent != nil {
-				newHash := ExtractHashFromMagnet(bestTorrent.Magnet)
-				if newHash != "" && newHash != hash {
+			failedHash := strings.ToLower(hash)
+			pool, _, autoErr := s.resolveCandidatePool(ctx, tconst, season, true)
+			if autoErr == nil && len(pool) > 0 {
+				for _, cand := range pool {
+					candHash := strings.ToLower(cand.InfoHash)
+					if candHash == "" && cand.Magnet != "" {
+						candHash = strings.ToLower(ExtractHashFromMagnet(cand.Magnet))
+					}
+
+					// If candidate has the same hash as the failed hash or is empty, try a fresh live topic resolve
+					if (candHash == "" || candHash == failedHash) && cand.Tracker != "" && cand.ID != "" && s.aggregator != nil {
+						freshHash, err := s.aggregator.ResolveInfoHashFresh(ctx, cand.Tracker, cand.ID)
+						if err == nil && freshHash != "" {
+							candHash = strings.ToLower(freshHash)
+							cand.InfoHash = freshHash
+							cand.Magnet = aggregator.BuildMultiTrackerMagnet(freshHash, cand.Title, nil, []string{cand.Tracker})
+						}
+					}
+
+					if candHash == "" && cand.Magnet != "" {
+						candHash = strings.ToLower(ExtractHashFromMagnet(cand.Magnet))
+					}
+
+					if candHash == "" || candHash == failedHash {
+						continue
+					}
+
+					if cand.Magnet == "" && cand.Tracker != "" && cand.ID != "" && s.aggregator != nil {
+						cand.Magnet = aggregator.BuildMultiTrackerMagnet(candHash, cand.Title, nil, []string{cand.Tracker})
+					}
+
 					mountReq := MountRequest{
 						Tconst:      tconst,
-						Title:       bestTorrent.Title,
-						Magnet:      bestTorrent.Magnet,
+						Title:       cand.Title,
+						Magnet:      cand.Magnet,
 						Season:      season,
+						Episode:     episode,
 						Type:        "tvSeries",
-						Tracker:     bestTorrent.Tracker,
-						TorrentID:   bestTorrent.ID,
-						Resolution:  bestTorrent.Resolution,
+						Tracker:     cand.Tracker,
+						TorrentID:   cand.ID,
+						Resolution:  cand.Resolution,
 						VersionName: "Auto",
 					}
 					mountResp, mErr := s.MountTorrent(ctx, mountReq)
-					if mErr == nil && mountResp != nil && mountResp.Success {
-						newRec, _ := s.torrClient.GetTorrent(ctx, newHash)
-						if newRec == nil || len(newRec.FileStats) == 0 {
-							newRec, _ = s.torrClient.WaitMetadata(ctx, newHash, 5*time.Second)
-						}
-						if newRec != nil && len(newRec.FileStats) > 0 {
-							matchedNew, matchErrNew := s.torrClient.MatchFile(newRec, season, episode)
-							if matchErrNew == nil && matchedNew != nil {
-								rec = newRec
-								hash = newHash
-								magnet = bestTorrent.Magnet
-								title = bestTorrent.Title
-								targetFileIdx = matchedNew.ID
-								targetFilePath = matchedNew.Path
-								matchErr = nil
-							}
+					if mErr != nil || mountResp == nil || !mountResp.Success {
+						continue
+					}
+
+					newRec, _ := s.torrClient.GetTorrent(ctx, candHash)
+					if newRec == nil || len(newRec.FileStats) == 0 {
+						newRec, _ = s.torrClient.WaitMetadata(ctx, candHash, 5*time.Second)
+					}
+					if newRec != nil && len(newRec.FileStats) > 0 {
+						matchedNew, matchErrNew := s.torrClient.MatchFile(newRec, season, episode)
+						if matchErrNew == nil && matchedNew != nil {
+							rec = newRec
+							hash = candHash
+							magnet = cand.Magnet
+							title = cand.Title
+							targetFileIdx = matchedNew.ID
+							targetFilePath = matchedNew.Path
+							matchErr = nil
+							log.Printf("[stream] Successfully auto-switched to torrent %s (%q) for S%02dE%02d",
+								candHash, cand.Title, season, episode)
+							break
 						}
 					}
 				}

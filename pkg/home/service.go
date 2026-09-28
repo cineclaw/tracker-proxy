@@ -37,6 +37,11 @@ type FeedShelfRaw struct {
 	Items []FeedItemRaw `json:"items"`
 }
 
+type cachedFeed struct {
+	payload  *HomePayload
+	cachedAt time.Time
+}
+
 type Service struct {
 	playStore  *playback.Store
 	nextUpSvc  *playback.NextUpService
@@ -45,8 +50,7 @@ type Service struct {
 	httpClient *http.Client
 
 	mu       sync.RWMutex
-	cached   *HomePayload
-	cachedAt time.Time
+	cache    map[string]cachedFeed
 	cacheTTL time.Duration
 }
 
@@ -66,6 +70,7 @@ func NewService(
 		hotlistSvc: hotlistSvc,
 		indexerURL: strings.TrimRight(indexerURL, "/"),
 		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cache:      make(map[string]cachedFeed),
 		cacheTTL:   cacheTTL,
 	}
 }
@@ -74,14 +79,17 @@ func NewService(
 func (s *Service) InvalidateWatchState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cached = nil
+	s.cache = make(map[string]cachedFeed)
 }
 
-func (s *Service) fetchIndexerFeeds(ctx context.Context) ([]FeedShelfRaw, error) {
+func (s *Service) fetchIndexerFeeds(ctx context.Context, profile string) ([]FeedShelfRaw, error) {
 	if s.indexerURL == "" {
 		return nil, fmt.Errorf("indexer URL not configured")
 	}
 	reqURL := fmt.Sprintf("%s/api/feeds", s.indexerURL)
+	if profile != "" && profile != "default" {
+		reqURL = fmt.Sprintf("%s/api/feeds?profile=%s", s.indexerURL, profile)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -103,12 +111,17 @@ func (s *Service) fetchIndexerFeeds(ctx context.Context) ([]FeedShelfRaw, error)
 	return shelves, nil
 }
 
-func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh bool) (*HomePayload, error) {
+func (s *Service) GetHomeFeed(ctx context.Context, platform string, profile string, forceRefresh bool) (*HomePayload, error) {
+	if profile == "" {
+		profile = "default"
+	}
 	s.mu.RLock()
-	if !forceRefresh && s.cached != nil && time.Since(s.cachedAt) < s.cacheTTL {
-		cachedCopy := s.cached
-		s.mu.RUnlock()
-		return cachedCopy, nil
+	if !forceRefresh {
+		if c, ok := s.cache[profile]; ok && time.Since(c.cachedAt) < s.cacheTTL {
+			cachedCopy := c.payload
+			s.mu.RUnlock()
+			return cachedCopy, nil
+		}
 	}
 	s.mu.RUnlock()
 
@@ -122,6 +135,8 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		indexerFeeds          []FeedShelfRaw
 	)
 
+	isKids := profile == "kids"
+
 	// Context with timeout to prevent slow external scrapers from blocking home load
 	aggCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
@@ -131,7 +146,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 	// 1a. SQLite Continue Watching In-Progress (<1ms)
 	if s.playStore != nil {
 		g.Go(func() error {
-			items, err := s.playStore.GetResumeList(20)
+			items, err := s.playStore.GetResumeList(20, profile)
 			if err != nil {
 				log.Printf("HomeService: GetResumeList: %v", err)
 			} else {
@@ -144,7 +159,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 	// 1b. Next Up Episodes for completed series (<5ms)
 	if s.nextUpSvc != nil {
 		g.Go(func() error {
-			items, err := s.nextUpSvc.GetNextUpItems(10)
+			items, err := s.nextUpSvc.GetNextUpItems(10, profile)
 			if err != nil {
 				log.Printf("HomeService: GetNextUpItems: %v", err)
 			} else {
@@ -157,7 +172,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 	// 2. SQLite Watchlist (<1ms)
 	if s.playStore != nil {
 		g.Go(func() error {
-			items, err := s.playStore.GetWatchlist(gCtx)
+			items, err := s.playStore.GetWatchlist(gCtx, profile)
 			if err != nil {
 				log.Printf("HomeService: GetWatchlist: %v", err)
 			} else {
@@ -167,48 +182,74 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		})
 	}
 
-	// 3. Hotlist - New Movies (RuTor fresh in bbolt/RAM)
-	if s.hotlistSvc != nil {
-		g.Go(func() error {
-			resp, err := s.hotlistSvc.GetHotlist(gCtx, "new_movie", "", 1, 20, false)
-			if err != nil {
-				log.Printf("HomeService: hotlist new_movie: %v", err)
-			} else {
-				trackerFreshResp = resp
-			}
-			return nil
-		})
-	}
+	if isKids {
+		// Kids Mode: Cartoon swarms from RuTor (Category 7)
+		if s.hotlistSvc != nil {
+			g.Go(func() error {
+				resp, err := s.hotlistSvc.GetHotlist(gCtx, "new_kids", "", 1, 20, false)
+				if err != nil {
+					log.Printf("HomeService: hotlist new_kids: %v", err)
+				} else {
+					trackerFreshResp = resp
+				}
+				return nil
+			})
 
-	// 4. Hotlist - Popular Swarms (RuTor hotlist in bbolt/RAM)
-	if s.hotlistSvc != nil {
-		g.Go(func() error {
-			resp, err := s.hotlistSvc.GetHotlist(gCtx, "movie", "", 1, 20, false)
-			if err != nil {
-				log.Printf("HomeService: hotlist popular: %v", err)
-			} else {
-				trackerHotlistResp = resp
-			}
-			return nil
-		})
-	}
+			g.Go(func() error {
+				resp, err := s.hotlistSvc.GetHotlist(gCtx, "kids_popular", "", 1, 20, false)
+				if err != nil {
+					log.Printf("HomeService: hotlist kids_popular: %v", err)
+				} else {
+					trackerHotlistResp = resp
+				}
+				return nil
+			})
+		}
+	} else {
+		// Standard Mode: Movies & TV swarms
+		// 3. Hotlist - New Movies (RuTor fresh in bbolt/RAM)
+		if s.hotlistSvc != nil {
+			g.Go(func() error {
+				resp, err := s.hotlistSvc.GetHotlist(gCtx, "new_movie", "", 1, 20, false)
+				if err != nil {
+					log.Printf("HomeService: hotlist new_movie: %v", err)
+				} else {
+					trackerFreshResp = resp
+				}
+				return nil
+			})
+		}
 
-	// 5. Hotlist - 4K UHD Pure Swarms (RuTor in bbolt/RAM)
-	if s.hotlistSvc != nil {
-		g.Go(func() error {
-			resp, err := s.hotlistSvc.GetHotlist(gCtx, "movie", "4k", 1, 20, false)
-			if err != nil {
-				log.Printf("HomeService: hotlist 4k: %v", err)
-			} else {
-				uhd4kResp = resp
-			}
-			return nil
-		})
+		// 4. Hotlist - Popular Swarms (RuTor hotlist in bbolt/RAM)
+		if s.hotlistSvc != nil {
+			g.Go(func() error {
+				resp, err := s.hotlistSvc.GetHotlist(gCtx, "movie", "", 1, 20, false)
+				if err != nil {
+					log.Printf("HomeService: hotlist popular: %v", err)
+				} else {
+					trackerHotlistResp = resp
+				}
+				return nil
+			})
+		}
+
+		// 5. Hotlist - 4K UHD Pure Swarms (RuTor in bbolt/RAM)
+		if s.hotlistSvc != nil {
+			g.Go(func() error {
+				resp, err := s.hotlistSvc.GetHotlist(gCtx, "movie", "4k", 1, 20, false)
+				if err != nil {
+					log.Printf("HomeService: hotlist 4k: %v", err)
+				} else {
+					uhd4kResp = resp
+				}
+				return nil
+			})
+		}
 	}
 
 	// 6. Curated Shelves & Hero Carousel from indexer/TMDB
 	g.Go(func() error {
-		shelves, err := s.fetchIndexerFeeds(gCtx)
+		shelves, err := s.fetchIndexerFeeds(gCtx, profile)
 		if err != nil {
 			log.Printf("HomeService: fetchIndexerFeeds: %v", err)
 		} else {
@@ -221,24 +262,48 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 
 	// Build Hero Items (Top 5 from trending shelf, rating >= 6.0 or unrated)
 	var heroItems []HomeItem
-	if len(indexerFeeds) > 0 && len(indexerFeeds[0].Items) > 0 {
-		for _, it := range indexerFeeds[0].Items {
-			if it.Rating != nil && *it.Rating > 0 && *it.Rating < 6.0 {
-				continue
+	if isKids {
+		if trackerHotlistResp != nil && len(trackerHotlistResp.Items) > 0 {
+			for _, it := range trackerHotlistResp.Items {
+				if it.Rating > 0 && it.Rating < 6.0 {
+					continue
+				}
+				heroItems = append(heroItems, mapHotlistItem(it, ""))
+				if len(heroItems) >= 5 {
+					break
+				}
 			}
-			heroItems = append(heroItems, mapFeedItem(it))
-			if len(heroItems) >= 5 {
-				break
+		} else if len(indexerFeeds) > 0 && len(indexerFeeds[0].Items) > 0 {
+			for _, it := range indexerFeeds[0].Items {
+				if it.Rating != nil && *it.Rating > 0 && *it.Rating < 6.0 {
+					continue
+				}
+				heroItems = append(heroItems, mapFeedItem(it))
+				if len(heroItems) >= 5 {
+					break
+				}
 			}
 		}
-	} else if trackerHotlistResp != nil && len(trackerHotlistResp.Items) > 0 {
-		for _, it := range trackerHotlistResp.Items {
-			if it.Rating > 0 && it.Rating < 6.0 {
-				continue
+	} else {
+		if len(indexerFeeds) > 0 && len(indexerFeeds[0].Items) > 0 {
+			for _, it := range indexerFeeds[0].Items {
+				if it.Rating != nil && *it.Rating > 0 && *it.Rating < 6.0 {
+					continue
+				}
+				heroItems = append(heroItems, mapFeedItem(it))
+				if len(heroItems) >= 5 {
+					break
+				}
 			}
-			heroItems = append(heroItems, mapHotlistItem(it, ""))
-			if len(heroItems) >= 5 {
-				break
+		} else if trackerHotlistResp != nil && len(trackerHotlistResp.Items) > 0 {
+			for _, it := range trackerHotlistResp.Items {
+				if it.Rating > 0 && it.Rating < 6.0 {
+					continue
+				}
+				heroItems = append(heroItems, mapHotlistItem(it, ""))
+				if len(heroItems) >= 5 {
+					break
+				}
 			}
 		}
 	}
@@ -298,7 +363,8 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		})
 	}
 
-	// 3. Fresh on Trackers Shelf ("Новинки на трекерах")
+	// Prepare Tracker Fresh shelf ("Новинки на трекерах")
+	var freshShelf *HomeShelf
 	if trackerFreshResp != nil && len(trackerFreshResp.Items) > 0 {
 		var items []HomeItem
 		for _, item := range trackerFreshResp.Items {
@@ -308,18 +374,27 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 			items = append(items, mapHotlistItem(item, "🌱 Свежие"))
 		}
 		if len(items) > 0 {
-			shelves = append(shelves, HomeShelf{
+			freshTitle := "Новинки на трекерах"
+			if isKids {
+				freshTitle = "Новинки на трекерах для детей"
+			}
+			freshShelf = &HomeShelf{
 				ID:          "tracker_fresh",
-				Title:       "Новинки на трекерах",
+				Title:       freshTitle,
 				Type:        "poster",
 				Badge:       "🌱 Свежие",
 				ActionRoute: "shelf/tracker_fresh",
 				Items:       items,
-			})
+			}
 		}
 	}
 
-	// 4. Popular on Trackers Shelf ("Популярно на трекерах")
+	// In adult/standard mode, fresh tracker releases go right after watchlist
+	if !isKids && freshShelf != nil {
+		shelves = append(shelves, *freshShelf)
+	}
+
+	// Popular on Trackers Shelf ("Популярно на трекерах")
 	if trackerHotlistResp != nil && len(trackerHotlistResp.Items) > 0 {
 		var items []HomeItem
 		for _, item := range trackerHotlistResp.Items {
@@ -340,8 +415,8 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		}
 	}
 
-	// 5. 4K UHD Кинозал Shelf
-	if uhd4kResp != nil && len(uhd4kResp.Items) > 0 {
+	// 4K UHD Кинозал Shelf (only in adult/standard mode)
+	if !isKids && uhd4kResp != nil && len(uhd4kResp.Items) > 0 {
 		var items []HomeItem
 		for _, item := range uhd4kResp.Items {
 			if item.Rating > 0 && item.Rating < 6.0 {
@@ -361,8 +436,13 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		}
 	}
 
-	// 6+. TMDB Feeds
+	// TMDB Curated Feeds
+	var feedShelves []HomeShelf
 	for _, feed := range indexerFeeds {
+		if isKids && feed.ID == "kids_cartoons" {
+			// Skip "Популярные мультфильмы" in kids mode to avoid duplicate with "Популярно на трекерах"
+			continue
+		}
 		if len(feed.Items) == 0 {
 			continue
 		}
@@ -374,7 +454,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 			items = append(items, mapFeedItem(it))
 		}
 		if len(items) > 0 {
-			shelves = append(shelves, HomeShelf{
+			feedShelves = append(feedShelves, HomeShelf{
 				ID:          feed.ID,
 				Title:       feed.Title,
 				Type:        "poster",
@@ -384,6 +464,40 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 		}
 	}
 
+	if isKids {
+		// Specific Kids order:
+		// 1. "Волшебные миры Disney & Pixar" (kids_magic)
+		// 2. "Семейное кино и сказки" (kids_family)
+		// 3. "Российская анимация и сказки" (kids_russian)
+		// 4. "Любимые мультсериалы" (kids_series)
+		// 5. "Экшен, аниме и супергерои" (kids_action)
+		priorityOrder := map[string]int{
+			"kids_magic":   1,
+			"kids_family":  2,
+			"kids_russian": 3,
+			"kids_series":  4,
+			"kids_action":  5,
+		}
+		sort.SliceStable(feedShelves, func(i, j int) bool {
+			p1, ok1 := priorityOrder[feedShelves[i].ID]
+			if !ok1 {
+				p1 = 99
+			}
+			p2, ok2 := priorityOrder[feedShelves[j].ID]
+			if !ok2 {
+				p2 = 99
+			}
+			return p1 < p2
+		})
+	}
+
+	shelves = append(shelves, feedShelves...)
+
+	// In kids mode, "Новинки на трекерах для детей" goes to the very end of all shelves
+	if isKids && freshShelf != nil {
+		shelves = append(shelves, *freshShelf)
+	}
+
 	payload := &HomePayload{
 		Hero:    heroItems,
 		Shelves: shelves,
@@ -391,8 +505,10 @@ func (s *Service) GetHomeFeed(ctx context.Context, platform string, forceRefresh
 
 	// Cache successful payload in RAM
 	s.mu.Lock()
-	s.cached = payload
-	s.cachedAt = time.Now()
+	s.cache[profile] = cachedFeed{
+		payload:  payload,
+		cachedAt: time.Now(),
+	}
 	s.mu.Unlock()
 
 	return payload, nil

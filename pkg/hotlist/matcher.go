@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type IndexerHit struct {
@@ -216,32 +218,162 @@ func (m *Matcher) MatchAndGroup(ctx context.Context, torrents []RawTorrent, medi
 	return result
 }
 
+var (
+	bracketStripRegex = regexp.MustCompile(`\[.*?\]|\(.*?\)|<.*?>`)
+)
+
 func cleanHotlistQuery(s string) string {
+	s = bracketStripRegex.ReplaceAllString(s, " ")
 	s = strings.ReplaceAll(s, "&", " and ")
 	s = strings.ReplaceAll(s, "/", " ")
 	s = strings.ReplaceAll(s, ":", " ")
 	s = strings.ReplaceAll(s, "!", " ")
 	s = strings.ReplaceAll(s, "?", " ")
 	s = strings.ReplaceAll(s, "\"", " ")
+	s = strings.ReplaceAll(s, ".", " ")
+	s = strings.ReplaceAll(s, ",", " ")
+	s = strings.ReplaceAll(s, "|", " ")
 	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 }
 
+func normalizeHotlistText(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func selectBestHit(hits []IndexerHit, targetRaw RawTorrent, query string) *IndexerHit {
+	if len(hits) == 0 {
+		return nil
+	}
+	if len(hits) == 1 {
+		return &hits[0]
+	}
+
+	normQuery := normalizeHotlistText(query)
+	normOrig := normalizeHotlistText(targetRaw.OriginalTitle)
+	normRu := normalizeHotlistText(targetRaw.RussianTitle)
+
+	bestIdx := 0
+	bestScore := -10000.0
+
+	for i, hit := range hits {
+		score := 0.0
+
+		// Desirable vs undesirable title types
+		tType := strings.ToLower(hit.Movie.TitleType)
+		switch tType {
+		case "movie", "tvseries", "tvminiseries":
+			score += 25.0
+		case "tvepisode", "videogame", "short":
+			score -= 50.0
+		}
+
+		// Reward having a poster
+		hasPoster := (hit.PosterPath != nil && *hit.PosterPath != "") ||
+			(hit.Posters.Large != "" && !strings.HasPrefix(hit.Posters.Large, "/poster/")) ||
+			(hit.PosterURL != "" && !strings.HasPrefix(hit.PosterURL, "/poster/"))
+		if hasPoster {
+			score += 30.0
+		}
+
+		// Year matching
+		if targetRaw.Year > 1900 && hit.Movie.Year != nil {
+			diff := *hit.Movie.Year - targetRaw.Year
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff == 0 {
+				score += 40.0
+			} else if diff == 1 {
+				score += 25.0
+			} else if diff <= 3 {
+				score += 10.0
+			} else {
+				score -= 20.0
+			}
+		}
+
+		// Title similarity
+		hitOrig := normalizeHotlistText(hit.Movie.TitleOrig)
+		hitPrimary := normalizeHotlistText(hit.Movie.TitlePrimary)
+		hitRu := ""
+		if hit.Movie.TitleRu != nil {
+			hitRu = normalizeHotlistText(*hit.Movie.TitleRu)
+		}
+
+		if (normOrig != "" && (hitOrig == normOrig || hitPrimary == normOrig)) ||
+			(normRu != "" && hitRu == normRu) ||
+			(normQuery != "" && (hitOrig == normQuery || hitRu == normQuery)) {
+			score += 60.0
+		} else if (normOrig != "" && (strings.HasPrefix(hitOrig, normOrig) || strings.HasPrefix(normOrig, hitOrig))) ||
+			(normRu != "" && (strings.HasPrefix(hitRu, normRu) || strings.HasPrefix(normRu, hitRu))) {
+			score += 30.0
+		}
+
+		if hit.Movie.Rating != nil && *hit.Movie.Rating > 0 {
+			score += *hit.Movie.Rating
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+
+	return &hits[bestIdx]
+}
+
 func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *IndexerHit {
-	// Query priority: OriginalTitle > RussianTitle
+	// Query priority: OriginalTitle > RussianTitle > Raw slash parts
 	queries := []string{}
+	addQuery := func(q string) {
+		q = cleanHotlistQuery(q)
+		if q == "" || len(q) < 2 {
+			return
+		}
+		for _, existing := range queries {
+			if strings.EqualFold(existing, q) {
+				return
+			}
+		}
+		queries = append(queries, q)
+	}
+
 	if t.OriginalTitle != "" {
-		queries = append(queries, t.OriginalTitle)
+		addQuery(t.OriginalTitle)
 	}
 	if t.RussianTitle != "" && t.RussianTitle != t.OriginalTitle {
-		queries = append(queries, t.RussianTitle)
+		addQuery(t.RussianTitle)
 	}
 
-	titleType := "movie"
-	if mediaType == "tv" || mediaType == "new_tv" {
+	// Extract slash-separated parts from RawTitle (e.g. "Поток / Straume / Flow (2024)...")
+	rawBeforeYear := t.RawTitle
+	if idx := strings.IndexAny(rawBeforeYear, "(["); idx > 0 {
+		rawBeforeYear = rawBeforeYear[:idx]
+	}
+	for _, p := range strings.Split(rawBeforeYear, "/") {
+		addQuery(p)
+	}
+
+	// Determine titleType for Tantivy search:
+	// For "new_kids", "kids_popular", "anime": titleType is "" to allow both movies and TV series
+	titleType := ""
+	switch mediaType {
+	case "tv", "new_tv":
 		titleType = "tvSeries"
+	case "movie", "new_movie", "doc":
+		titleType = "movie"
+	default:
+		titleType = ""
 	}
 
-	doSearch := func(query string, withYear bool) *IndexerHit {
+	doSearch := func(query string, withYear bool, filterType string) *IndexerHit {
 		qClean := cleanHotlistQuery(query)
 		if qClean == "" {
 			return nil
@@ -252,8 +384,10 @@ func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *I
 		}
 		params := url.Values{}
 		params.Set("q", qClean)
-		params.Set("type", titleType)
-		params.Set("limit", "2")
+		if filterType != "" {
+			params.Set("type", filterType)
+		}
+		params.Set("limit", "5")
 		if withYear && t.Year > 1900 {
 			params.Set("year_from", fmt.Sprintf("%d", t.Year-1))
 			params.Set("year_to", fmt.Sprintf("%d", t.Year+1))
@@ -272,21 +406,32 @@ func (m *Matcher) lookup(ctx context.Context, t RawTorrent, mediaType string) *I
 
 		var searchResp IndexerSearchResponse
 		if err := json.NewDecoder(resp.Body).Decode(&searchResp); err == nil && len(searchResp.Hits) > 0 {
-			return &searchResp.Hits[0]
+			return selectBestHit(searchResp.Hits, t, qClean)
 		}
 		return nil
 	}
 
-	// 1. Try queries with year filter first
+	// 1. Try queries with year filter and category titleType
 	for _, q := range queries {
-		if hit := doSearch(q, true); hit != nil {
+		if hit := doSearch(q, true, titleType); hit != nil {
 			return hit
 		}
 	}
-	// 2. If no hit, retry queries without year filter (trackers often differ by ±1-2 years)
+	// 2. Retry queries without year filter (trackers often differ by ±1-3 years or re-seeds like 2026 vs 1986)
 	for _, q := range queries {
-		if hit := doSearch(q, false); hit != nil {
+		if hit := doSearch(q, false, titleType); hit != nil {
 			return hit
+		}
+	}
+	// 3. If category had strict titleType (e.g. "movie" or "tvSeries"), retry without titleType restriction
+	if titleType != "" {
+		for _, q := range queries {
+			if hit := doSearch(q, true, ""); hit != nil {
+				return hit
+			}
+			if hit := doSearch(q, false, ""); hit != nil {
+				return hit
+			}
 		}
 	}
 

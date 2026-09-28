@@ -37,10 +37,11 @@ type Tracker struct {
 	jar                *cookiejar.Jar
 	enabled            bool
 
-	stateMu    sync.RWMutex
-	solveMu    sync.Mutex
-	lastSolved time.Time
-	lastLogin  time.Time
+	onCookieUpdated    func(cookie, userAgent string)
+	stateMu            sync.RWMutex
+	solveMu            sync.Mutex
+	lastSolved         time.Time
+	lastLogin          time.Time
 }
 
 func New(baseURL, username, password, rawCookie, userAgent string, fsClient *flaresolverr.Client) *Tracker {
@@ -74,11 +75,13 @@ func New(baseURL, username, password, rawCookie, userAgent string, fsClient *fla
 	return t
 }
 
+func (t *Tracker) SetOnCookieUpdated(fn func(cookie, userAgent string)) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	t.onCookieUpdated = fn
+}
+
 func (t *Tracker) applyRawCookie(raw string) {
-	u, err := url.Parse(t.baseURL)
-	if err != nil {
-		return
-	}
 	parts := strings.Split(raw, ";")
 	var cookies []*http.Cookie
 	for _, part := range parts {
@@ -91,22 +94,29 @@ func (t *Tracker) applyRawCookie(raw string) {
 			cookies = append(cookies, &http.Cookie{
 				Name:  strings.TrimSpace(kv[0]),
 				Value: strings.TrimSpace(kv[1]),
+				Path:  "/",
 			})
 		}
 	}
-	t.jar.SetCookies(u, cookies)
+	if u, err := url.Parse(t.baseURL); err == nil {
+		t.jar.SetCookies(u, cookies)
+	}
+	if uForum, err := url.Parse(t.baseURL + "/forum/"); err == nil {
+		t.jar.SetCookies(uForum, cookies)
+	}
 }
 
 func (t *Tracker) setOrReplaceCookie(name, value string) {
-	u, _ := url.Parse(t.baseURL)
-	if u != nil {
-		t.jar.SetCookies(u, []*http.Cookie{
-			{
-				Name:  name,
-				Value: value,
-				Path:  "/",
-			},
-		})
+	for _, sub := range []string{"", "/forum/"} {
+		if u, err := url.Parse(t.baseURL + sub); err == nil {
+			t.jar.SetCookies(u, []*http.Cookie{
+				{
+					Name:  name,
+					Value: value,
+					Path:  "/",
+				},
+			})
+		}
 	}
 
 	// Also update t.cookie string representation
@@ -195,8 +205,6 @@ func (t *Tracker) GetStatus() RuTrackerStatus {
 
 func (t *Tracker) UpdateCookieAndUserAgent(rawCookie, userAgent string) {
 	t.stateMu.Lock()
-	defer t.stateMu.Unlock()
-
 	t.cookie = strings.TrimSpace(rawCookie)
 	if strings.TrimSpace(userAgent) != "" {
 		t.userAgent = strings.TrimSpace(userAgent)
@@ -211,6 +219,14 @@ func (t *Tracker) UpdateCookieAndUserAgent(rawCookie, userAgent string) {
 	}
 	t.lastLogin = time.Time{}
 	t.lastSolved = time.Now()
+	cb := t.onCookieUpdated
+	savedCookie := t.cookie
+	savedUA := t.userAgent
+	t.stateMu.Unlock()
+
+	if cb != nil {
+		cb(savedCookie, savedUA)
+	}
 }
 
 func (t *Tracker) TestConnection(ctx context.Context) (int, string, error) {
@@ -302,6 +318,17 @@ func (t *Tracker) EnsureClearance(ctx context.Context) error {
 	if t.username != "" && t.password != "" {
 		_ = t.loginInternal(ctx)
 	}
+
+	t.stateMu.RLock()
+	cb := t.onCookieUpdated
+	savedCookie := t.cookie
+	savedUA := t.userAgent
+	t.stateMu.RUnlock()
+
+	if cb != nil {
+		cb(savedCookie, savedUA)
+	}
+
 	return nil
 }
 
@@ -355,10 +382,11 @@ func (t *Tracker) loginInternal(ctx context.Context) error {
 	for _, c := range resp.Cookies() {
 		t.setOrReplaceCookie(c.Name, c.Value)
 	}
-	u, _ := url.Parse(t.baseURL)
-	if u != nil {
-		for _, c := range t.jar.Cookies(u) {
-			t.setOrReplaceCookie(c.Name, c.Value)
+	for _, sub := range []string{"", "/forum/"} {
+		if u, err := url.Parse(t.baseURL + sub); err == nil {
+			for _, c := range t.jar.Cookies(u) {
+				t.setOrReplaceCookie(c.Name, c.Value)
+			}
 		}
 	}
 	t.lastLogin = time.Now()
@@ -473,27 +501,20 @@ func (t *Tracker) Search(ctx context.Context, query models.SearchQuery) ([]model
 			break
 		}
 
-		// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution with short timeout
+		// If 403 Forbidden and FlareSolverr is enabled, attempt automatic challenge resolution
 		if resp.StatusCode == http.StatusForbidden && t.flaresolverrClient != nil {
 			resp.Body.Close()
 			log.Printf("[rutracker] Received HTTP 403 Forbidden; acquiring Cloudflare clearance via FlareSolverr...")
 
-			solveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			if solveErr := t.EnsureClearance(solveCtx); solveErr != nil {
-				cancel()
-				log.Printf("[rutracker] FlareSolverr challenge attempt failed/skipped (%v); RuTracker needs cookie", solveErr)
+			solveCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			solveErr := t.EnsureClearance(solveCtx)
+			cancel()
+			if solveErr != nil {
+				log.Printf("[rutracker] FlareSolverr challenge attempt failed (%v); RuTracker needs cookie", solveErr)
 				if page == 0 {
 					return nil, fmt.Errorf("rutracker 403 (cookie required): %w", solveErr)
 				}
 				break
-			}
-			cancel()
-
-			// Retry login if credentials exist and bb_session was not provided
-			if t.username != "" && t.password != "" && !strings.Contains(t.cookie, "bb_session") {
-				solveCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
-				_ = t.Login(solveCtx2)
-				cancel2()
 			}
 
 			// Retry search request with fresh clearance and User-Agent

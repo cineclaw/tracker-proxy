@@ -10,6 +10,7 @@ import (
 
 type WatchlistItem struct {
 	ImdbID        string    `json:"imdb_id"`
+	Profile       string    `json:"profile,omitempty"`
 	MediaType     string    `json:"media_type"`
 	Title         string    `json:"title"`
 	OriginalTitle string    `json:"original_title,omitempty"`
@@ -20,12 +21,14 @@ type WatchlistItem struct {
 	AddedAt       time.Time `json:"added_at"`
 }
 
-func (s *Store) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
-	query := `SELECT imdb_id, media_type, title, original_title, year, rating, poster_path, backdrop_path, added_at 
+func (s *Store) GetWatchlist(ctx context.Context, profile ...string) ([]WatchlistItem, error) {
+	prof := cleanProfile(profile...)
+	query := `SELECT imdb_id, profile, media_type, title, original_title, year, rating, poster_path, backdrop_path, added_at 
 	          FROM media_watchlist 
+	          WHERE profile = ?
 	          ORDER BY added_at DESC`
 
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.QueryContext(ctx, query, prof)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query watchlist: %w", err)
 	}
@@ -41,6 +44,7 @@ func (s *Store) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 
 		if err := rows.Scan(
 			&item.ImdbID,
+			&item.Profile,
 			&item.MediaType,
 			&item.Title,
 			&origTitle,
@@ -76,9 +80,9 @@ func (s *Store) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 				if item.BackdropPath == "" {
 					item.BackdropPath = b
 				}
-				go func(id, posterVal, backdropVal string) {
-					_, _ = s.db.Exec(`UPDATE media_watchlist SET poster_path = ?, backdrop_path = ? WHERE imdb_id = ?`, posterVal, backdropVal, id)
-				}(item.ImdbID, p, b)
+				go func(id, profVal, posterVal, backdropVal string) {
+					_, _ = s.db.Exec(`UPDATE media_watchlist SET poster_path = ?, backdrop_path = ? WHERE profile = ? AND imdb_id = ?`, posterVal, backdropVal, profVal, id)
+				}(item.ImdbID, item.Profile, p, b)
 			}
 		}
 
@@ -88,13 +92,18 @@ func (s *Store) GetWatchlist(ctx context.Context) ([]WatchlistItem, error) {
 	return items, nil
 }
 
-func (s *Store) AddToWatchlist(ctx context.Context, item WatchlistItem) error {
+func (s *Store) AddToWatchlist(ctx context.Context, item WatchlistItem, profile ...string) error {
 	if item.ImdbID == "" {
 		return fmt.Errorf("imdb_id cannot be empty")
 	}
 	if item.MediaType == "" {
 		item.MediaType = "movie"
 	}
+	prof := cleanProfile(profile...)
+	if item.Profile != "" {
+		prof = item.Profile
+	}
+	item.Profile = prof
 
 	if strings.HasPrefix(item.PosterPath, "/poster/") || item.PosterPath == "" {
 		if p, b := s.ResolveTmdbPoster(item.ImdbID); p != "" {
@@ -105,9 +114,9 @@ func (s *Store) AddToWatchlist(ctx context.Context, item WatchlistItem) error {
 		}
 	}
 
-	query := `INSERT INTO media_watchlist (imdb_id, media_type, title, original_title, year, rating, poster_path, backdrop_path, added_at)
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	          ON CONFLICT(imdb_id) DO UPDATE SET
+	query := `INSERT INTO media_watchlist (profile, imdb_id, media_type, title, original_title, year, rating, poster_path, backdrop_path, added_at)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	          ON CONFLICT(profile, imdb_id) DO UPDATE SET
 	            media_type = excluded.media_type,
 	            title = excluded.title,
 	            original_title = excluded.original_title,
@@ -118,6 +127,7 @@ func (s *Store) AddToWatchlist(ctx context.Context, item WatchlistItem) error {
 	            added_at = CURRENT_TIMESTAMP`
 
 	_, err := s.db.ExecContext(ctx, query,
+		item.Profile,
 		item.ImdbID,
 		item.MediaType,
 		item.Title,
@@ -133,25 +143,27 @@ func (s *Store) AddToWatchlist(ctx context.Context, item WatchlistItem) error {
 	return nil
 }
 
-func (s *Store) RemoveFromWatchlist(ctx context.Context, imdbID string) error {
+func (s *Store) RemoveFromWatchlist(ctx context.Context, imdbID string, profile ...string) error {
 	if imdbID == "" {
 		return fmt.Errorf("imdb_id cannot be empty")
 	}
-	query := `DELETE FROM media_watchlist WHERE imdb_id = ?`
-	_, err := s.db.ExecContext(ctx, query, imdbID)
+	prof := cleanProfile(profile...)
+	query := `DELETE FROM media_watchlist WHERE profile = ? AND imdb_id = ?`
+	_, err := s.db.ExecContext(ctx, query, prof, imdbID)
 	if err != nil {
 		return fmt.Errorf("failed to remove from watchlist: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) IsInWatchlist(ctx context.Context, imdbID string) (bool, error) {
+func (s *Store) IsInWatchlist(ctx context.Context, imdbID string, profile ...string) (bool, error) {
 	if imdbID == "" {
 		return false, nil
 	}
-	query := `SELECT 1 FROM media_watchlist WHERE imdb_id = ? LIMIT 1`
+	prof := cleanProfile(profile...)
+	query := `SELECT 1 FROM media_watchlist WHERE profile = ? AND imdb_id = ? LIMIT 1`
 	var exists int
-	err := s.db.QueryRowContext(ctx, query, imdbID).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, query, prof, imdbID).Scan(&exists)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

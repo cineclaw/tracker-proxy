@@ -18,9 +18,12 @@ import (
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/db"
+	"tracker-proxy/pkg/discovery"
 	"tracker-proxy/pkg/flaresolverr"
 	"tracker-proxy/pkg/home"
 	"tracker-proxy/pkg/hotlist"
+	"tracker-proxy/pkg/monitor"
+	"tracker-proxy/pkg/notifications"
 	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
@@ -82,14 +85,41 @@ func main() {
 	trackers = append(trackers, rutrackerTracker)
 	log.Printf("Loaded tracker: %s (enabled: %v)", rutrackerTracker.Name(), rutrackerTracker.IsEnabled())
 
-	// Prefetch RuTracker clearance in background if FlareSolverr is enabled
+	// Wire auto-persistence of cookies to config.yaml
+	rutrackerTracker.SetOnCookieUpdated(func(cookie, userAgent string) {
+		if cfg != nil {
+			cfg.Trackers.RuTracker.Cookie = cookie
+			if userAgent != "" {
+				cfg.Trackers.RuTracker.UserAgent = userAgent
+			}
+			if err := cfg.Save(configPath); err != nil {
+				log.Printf("[trackers] Warning: failed to save updated RuTracker cookies to %s: %v", configPath, err)
+			} else {
+				log.Printf("[trackers] Auto-saved updated RuTracker cookies to %s", configPath)
+			}
+		}
+	})
+
+	// Prefetch and periodic RuTracker clearance keeper via FlareSolverr
 	if fsClient != nil && rutrackerTracker.IsEnabled() {
 		go func() {
 			log.Printf("Prefetching RuTracker Cloudflare clearance via FlareSolverr in background...")
 			bgCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
-			defer cancel()
 			if err := rutrackerTracker.EnsureClearance(bgCtx); err != nil {
 				log.Printf("Initial clearance prefetch notice: %v", err)
+			}
+			cancel()
+
+			// Periodic clearance refresh keeper (every 2 hours)
+			ticker := time.NewTicker(2 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				log.Printf("Periodic RuTracker Cloudflare clearance refresh via FlareSolverr...")
+				refreshCtx, rCancel := context.WithTimeout(context.Background(), 75*time.Second)
+				if err := rutrackerTracker.EnsureClearance(refreshCtx); err != nil {
+					log.Printf("Periodic clearance refresh notice: %v", err)
+				}
+				rCancel()
 			}
 		}()
 	}
@@ -151,9 +181,21 @@ func main() {
 	homeSvc := home.NewService(playStore, nextUpSvc, hotlistSvc, indexerURL, 60*time.Second)
 	log.Printf("Home BFF service initialized (indexer: %s)", indexerURL)
 
+	// Web Push & Ongoing Series Monitor
+	pushSvc, err := notifications.NewService(mediaDB.DB)
+	if err != nil {
+		log.Printf("Warning: failed to initialize push notifications service: %v", err)
+	} else {
+		log.Printf("Web Push notification service initialized (public key: %s...)", pushSvc.GetVAPIDPublicKey()[:16])
+	}
+
+	monitorSvc := monitor.NewService(mediaDB.DB, agg, streamSvc.TorrClient(), pushSvc, cacheStore, indexerURL)
+	monitorSvc.Start(30 * time.Minute)
+	defer monitorSvc.Stop()
+
 	// HTTP Server
 	mux := http.NewServeMux()
-	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc, transcodeEng, homeSvc, cfg, configPath)
+	handler := api.NewHandler(agg, cacheStore, authMgr, hotlistSvc, streamSvc, playStore, nextUpSvc, transcodeEng, homeSvc, pushSvc, monitorSvc, cfg, configPath)
 	handler.RegisterRoutes(mux)
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)
@@ -177,7 +219,14 @@ func main() {
 		}
 	}()
 
+	// UDP LAN Auto-Discovery Responder (Port 9118, HTTP Port 3000)
+	discoveryCtx, cancelDiscovery := context.WithCancel(context.Background())
+	defer cancelDiscovery()
+	discoverySrv := discovery.NewServer(cfg.Server.Port, 3000)
+	go discoverySrv.Start(discoveryCtx)
+
 	<-stop
+	cancelDiscovery()
 	log.Println("Shutting down server gracefully...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
