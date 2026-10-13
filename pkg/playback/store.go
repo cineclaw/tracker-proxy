@@ -103,8 +103,16 @@ func (s *Store) AutoHealLegacyPosters() {
 	}()
 }
 
+func cleanProfile(profile ...string) string {
+	if len(profile) > 0 && strings.TrimSpace(profile[0]) != "" {
+		return strings.TrimSpace(profile[0])
+	}
+	return "default"
+}
+
 type WatchProgressItem struct {
 	ID               int64     `json:"id"`
+	Profile          string    `json:"profile,omitempty"`
 	ImdbID           string    `json:"imdb_id"`
 	MediaType        string    `json:"media_type"` // "movie" or "tv"
 	Title            string    `json:"title"`
@@ -181,7 +189,13 @@ func parseSQLiteTime(s string) time.Time {
 }
 
 // SaveProgress upserts playback progress, automatically calculating percent and completion status
-func (s *Store) SaveProgress(item *WatchProgressItem) error {
+func (s *Store) SaveProgress(item *WatchProgressItem, profile ...string) error {
+	prof := cleanProfile(profile...)
+	if item.Profile != "" {
+		prof = item.Profile
+	}
+	item.Profile = prof
+
 	if strings.HasPrefix(item.PosterPath, "/poster/") || item.PosterPath == "" {
 		if p, b := s.ResolveTmdbPoster(item.ImdbID); p != "" {
 			item.PosterPath = p
@@ -212,19 +226,19 @@ func (s *Store) SaveProgress(item *WatchProgressItem) error {
 
 	query := `
 	INSERT INTO watch_progress (
-		imdb_id, media_type, title, poster_path, backdrop_path,
+		profile, imdb_id, media_type, title, poster_path, backdrop_path,
 		season_number, episode_number, episode_title, episode_still_path,
 		position_seconds, duration_seconds, playback_percent, is_completed,
 		torrent_hash, torrent_link, file_index, audio_index, subtitle_index,
 		last_watched_at
 	) VALUES (
-		?, ?, ?, ?, ?,
+		?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?,
 		?, ?, ?, ?,
 		?, ?, ?, ?, ?,
 		CURRENT_TIMESTAMP
 	)
-	ON CONFLICT(imdb_id, season_number, episode_number) DO UPDATE SET
+	ON CONFLICT(profile, imdb_id, season_number, episode_number) DO UPDATE SET
 		title = COALESCE(NULLIF(excluded.title, ''), watch_progress.title),
 		poster_path = COALESCE(NULLIF(excluded.poster_path, ''), watch_progress.poster_path),
 		backdrop_path = COALESCE(NULLIF(excluded.backdrop_path, ''), watch_progress.backdrop_path),
@@ -261,7 +275,7 @@ func (s *Store) SaveProgress(item *WatchProgressItem) error {
 	}
 
 	_, err := s.db.Exec(query,
-		item.ImdbID, item.MediaType, item.Title, item.PosterPath, item.BackdropPath,
+		item.Profile, item.ImdbID, item.MediaType, item.Title, item.PosterPath, item.BackdropPath,
 		item.SeasonNumber, item.EpisodeNumber, item.EpisodeTitle, item.EpisodeStillPath,
 		item.PositionSeconds, item.DurationSeconds, item.PlaybackPercent, completedInt,
 		item.TorrentHash, item.TorrentLink, item.FileIndex, item.AudioIndex, item.SubtitleIndex,
@@ -275,28 +289,29 @@ func (s *Store) SaveProgress(item *WatchProgressItem) error {
 		autoCompQuery := `
 		UPDATE watch_progress 
 		SET is_completed = 1, playback_percent = 100.0 
-		WHERE imdb_id = ? AND media_type = 'tv' 
+		WHERE profile = ? AND imdb_id = ? AND media_type = 'tv' 
 		  AND (season_number < ? OR (season_number = ? AND episode_number < ?))
 		  AND is_completed = 0;
 		`
-		_, _ = s.db.Exec(autoCompQuery, item.ImdbID, item.SeasonNumber, item.SeasonNumber, item.EpisodeNumber)
+		_, _ = s.db.Exec(autoCompQuery, item.Profile, item.ImdbID, item.SeasonNumber, item.SeasonNumber, item.EpisodeNumber)
 	}
 
 	return err
 }
 
 // GetResumeList returns in-progress titles (0.5% <= percent < 88%), deduplicating TV shows by latest watched event
-func (s *Store) GetResumeList(limit int) ([]WatchProgressItem, error) {
+func (s *Store) GetResumeList(limit int, profile ...string) ([]WatchProgressItem, error) {
 	if limit <= 0 {
 		limit = 20
 	}
+	prof := cleanProfile(profile...)
 
-	// Subquery groups by imdb_id across ALL watched items.
+	// Subquery groups by imdb_id across ALL watched items for this profile.
 	// If the latest watched episode of a show was completed (is_completed = 1),
 	// the outer WHERE filters it out so no ghost older episode is resurrected.
 	query := `
 	SELECT 
-		wp.id, wp.imdb_id, wp.media_type, wp.title, wp.poster_path, wp.backdrop_path,
+		wp.id, wp.profile, wp.imdb_id, wp.media_type, wp.title, wp.poster_path, wp.backdrop_path,
 		wp.season_number, wp.episode_number, wp.episode_title, wp.episode_still_path,
 		wp.position_seconds, wp.duration_seconds, wp.playback_percent, wp.is_completed,
 		wp.torrent_hash, wp.torrent_link, wp.file_index, wp.audio_index, wp.subtitle_index,
@@ -305,14 +320,15 @@ func (s *Store) GetResumeList(limit int) ([]WatchProgressItem, error) {
 	INNER JOIN (
 		SELECT imdb_id, MAX(last_watched_at) as max_watched
 		FROM watch_progress
+		WHERE profile = ?
 		GROUP BY imdb_id
 	) latest ON wp.imdb_id = latest.imdb_id AND wp.last_watched_at = latest.max_watched
-	WHERE wp.is_completed = 0 AND (wp.playback_percent >= 0.5 OR wp.position_seconds >= 10.0) AND wp.playback_percent < 88.0
+	WHERE wp.profile = ? AND wp.is_completed = 0 AND (wp.playback_percent >= 0.5 OR wp.position_seconds >= 10.0) AND wp.playback_percent < 88.0
 	ORDER BY wp.last_watched_at DESC
 	LIMIT ?;
 	`
 
-	rows, err := s.db.Query(query, limit)
+	rows, err := s.db.Query(query, prof, prof, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query resume list: %w", err)
 	}
@@ -326,7 +342,7 @@ func (s *Store) GetResumeList(limit int) ([]WatchProgressItem, error) {
 		var watchedAtStr string
 
 		err := rows.Scan(
-			&item.ID, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
+			&item.ID, &item.Profile, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
 			&item.SeasonNumber, &item.EpisodeNumber, &epTitle, &epStill,
 			&item.PositionSeconds, &item.DurationSeconds, &item.PlaybackPercent, &completedInt,
 			&tHash, &tLink, &item.FileIndex, &item.AudioIndex, &item.SubtitleIndex,
@@ -351,9 +367,9 @@ func (s *Store) GetResumeList(limit int) ([]WatchProgressItem, error) {
 				if item.BackdropPath == "" {
 					item.BackdropPath = b
 				}
-				go func(id, posterVal, backdropVal string) {
-					_, _ = s.db.Exec(`UPDATE watch_progress SET poster_path = ?, backdrop_path = ? WHERE imdb_id = ?`, posterVal, backdropVal, id)
-				}(item.ImdbID, p, b)
+				go func(id, pProf, posterVal, backdropVal string) {
+					_, _ = s.db.Exec(`UPDATE watch_progress SET poster_path = ?, backdrop_path = ? WHERE profile = ? AND imdb_id = ?`, posterVal, backdropVal, pProf, id)
+				}(item.ImdbID, item.Profile, p, b)
 			}
 		}
 
@@ -364,20 +380,21 @@ func (s *Store) GetResumeList(limit int) ([]WatchProgressItem, error) {
 }
 
 // GetItemProgress returns progress for a specific movie or episode
-func (s *Store) GetItemProgress(imdbId string, season, episode int) (*WatchProgressItem, error) {
+func (s *Store) GetItemProgress(imdbId string, season, episode int, profile ...string) (*WatchProgressItem, error) {
+	prof := cleanProfile(profile...)
 	query := `
 	SELECT 
-		id, imdb_id, media_type, title, poster_path, backdrop_path,
+		id, profile, imdb_id, media_type, title, poster_path, backdrop_path,
 		season_number, episode_number, episode_title, episode_still_path,
 		position_seconds, duration_seconds, playback_percent, is_completed,
 		torrent_hash, torrent_link, file_index, audio_index, subtitle_index,
 		last_watched_at
 	FROM watch_progress
-	WHERE imdb_id = ? AND season_number = ? AND episode_number = ?
+	WHERE profile = ? AND imdb_id = ? AND season_number = ? AND episode_number = ?
 	LIMIT 1;
 	`
 
-	row := s.db.QueryRow(query, imdbId, season, episode)
+	row := s.db.QueryRow(query, prof, imdbId, season, episode)
 
 	var item WatchProgressItem
 	var completedInt int
@@ -385,7 +402,7 @@ func (s *Store) GetItemProgress(imdbId string, season, episode int) (*WatchProgr
 	var watchedAtStr string
 
 	err := row.Scan(
-		&item.ID, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
+		&item.ID, &item.Profile, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
 		&item.SeasonNumber, &item.EpisodeNumber, &epTitle, &epStill,
 		&item.PositionSeconds, &item.DurationSeconds, &item.PlaybackPercent, &completedInt,
 		&tHash, &tLink, &item.FileIndex, &item.AudioIndex, &item.SubtitleIndex,
@@ -411,16 +428,17 @@ func (s *Store) GetItemProgress(imdbId string, season, episode int) (*WatchProgr
 }
 
 // GetSeriesProgress returns map of all watched episodes for a series
-func (s *Store) GetSeriesProgress(imdbId string) (map[string]EpisodeProgressStatus, error) {
+func (s *Store) GetSeriesProgress(imdbId string, profile ...string) (map[string]EpisodeProgressStatus, error) {
+	prof := cleanProfile(profile...)
 	query := `
 	SELECT 
 		season_number, episode_number, position_seconds, duration_seconds, 
 		playback_percent, is_completed
 	FROM watch_progress
-	WHERE imdb_id = ? AND media_type = 'tv';
+	WHERE profile = ? AND imdb_id = ? AND media_type = 'tv';
 	`
 
-	rows, err := s.db.Query(query, imdbId)
+	rows, err := s.db.Query(query, prof, imdbId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query series progress: %w", err)
 	}
@@ -445,21 +463,22 @@ func (s *Store) GetSeriesProgress(imdbId string) (map[string]EpisodeProgressStat
 }
 
 // GetLatestWatchedEpisode returns the most recently watched episode for a series
-func (s *Store) GetLatestWatchedEpisode(imdbId string) (*WatchProgressItem, error) {
+func (s *Store) GetLatestWatchedEpisode(imdbId string, profile ...string) (*WatchProgressItem, error) {
+	prof := cleanProfile(profile...)
 	query := `
 	SELECT 
-		id, imdb_id, media_type, title, poster_path, backdrop_path,
+		id, profile, imdb_id, media_type, title, poster_path, backdrop_path,
 		season_number, episode_number, episode_title, episode_still_path,
 		position_seconds, duration_seconds, playback_percent, is_completed,
 		torrent_hash, torrent_link, file_index, audio_index, subtitle_index,
 		last_watched_at
 	FROM watch_progress
-	WHERE imdb_id = ? AND media_type = 'tv'
+	WHERE profile = ? AND imdb_id = ? AND media_type = 'tv'
 	ORDER BY last_watched_at DESC
 	LIMIT 1;
 	`
 
-	row := s.db.QueryRow(query, imdbId)
+	row := s.db.QueryRow(query, prof, imdbId)
 
 	var item WatchProgressItem
 	var completedInt int
@@ -467,7 +486,7 @@ func (s *Store) GetLatestWatchedEpisode(imdbId string) (*WatchProgressItem, erro
 	var watchedAtStr string
 
 	err := row.Scan(
-		&item.ID, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
+		&item.ID, &item.Profile, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
 		&item.SeasonNumber, &item.EpisodeNumber, &epTitle, &epStill,
 		&item.PositionSeconds, &item.DurationSeconds, &item.PlaybackPercent, &completedInt,
 		&tHash, &tLink, &item.FileIndex, &item.AudioIndex, &item.SubtitleIndex,
@@ -493,21 +512,22 @@ func (s *Store) GetLatestWatchedEpisode(imdbId string) (*WatchProgressItem, erro
 }
 
 // GetLatestWatchedEpisodeForSeason returns the most recently watched episode for a specific season of a series
-func (s *Store) GetLatestWatchedEpisodeForSeason(imdbId string, season int) (*WatchProgressItem, error) {
+func (s *Store) GetLatestWatchedEpisodeForSeason(imdbId string, season int, profile ...string) (*WatchProgressItem, error) {
+	prof := cleanProfile(profile...)
 	query := `
 	SELECT 
-		id, imdb_id, media_type, title, poster_path, backdrop_path,
+		id, profile, imdb_id, media_type, title, poster_path, backdrop_path,
 		season_number, episode_number, episode_title, episode_still_path,
 		position_seconds, duration_seconds, playback_percent, is_completed,
 		torrent_hash, torrent_link, file_index, audio_index, subtitle_index,
 		last_watched_at
 	FROM watch_progress
-	WHERE imdb_id = ? AND media_type = 'tv' AND season_number = ?
+	WHERE profile = ? AND imdb_id = ? AND media_type = 'tv' AND season_number = ?
 	ORDER BY last_watched_at DESC
 	LIMIT 1;
 	`
 
-	row := s.db.QueryRow(query, imdbId, season)
+	row := s.db.QueryRow(query, prof, imdbId, season)
 
 	var item WatchProgressItem
 	var completedInt int
@@ -515,7 +535,7 @@ func (s *Store) GetLatestWatchedEpisodeForSeason(imdbId string, season int) (*Wa
 	var watchedAtStr string
 
 	err := row.Scan(
-		&item.ID, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
+		&item.ID, &item.Profile, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
 		&item.SeasonNumber, &item.EpisodeNumber, &epTitle, &epStill,
 		&item.PositionSeconds, &item.DurationSeconds, &item.PlaybackPercent, &completedInt,
 		&tHash, &tLink, &item.FileIndex, &item.AudioIndex, &item.SubtitleIndex,
@@ -541,15 +561,16 @@ func (s *Store) GetLatestWatchedEpisodeForSeason(imdbId string, season int) (*Wa
 }
 
 // GetWatchedSeasons returns list of distinct watched season numbers for a TV show
-func (s *Store) GetWatchedSeasons(imdbId string) ([]int, error) {
+func (s *Store) GetWatchedSeasons(imdbId string, profile ...string) ([]int, error) {
+	prof := cleanProfile(profile...)
 	query := `
 	SELECT DISTINCT season_number
 	FROM watch_progress
-	WHERE imdb_id = ? AND media_type = 'tv' AND season_number > 0
+	WHERE profile = ? AND imdb_id = ? AND media_type = 'tv' AND season_number > 0
 	ORDER BY season_number ASC;
 	`
 
-	rows, err := s.db.Query(query, imdbId)
+	rows, err := s.db.Query(query, prof, imdbId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query watched seasons: %w", err)
 	}
@@ -566,14 +587,15 @@ func (s *Store) GetWatchedSeasons(imdbId string) ([]int, error) {
 }
 
 // GetAllCompletedShows returns list of distinct TV show imdb_ids where at least one episode is completed
-func (s *Store) GetRecentlyCompletedSeries(limit int) ([]WatchProgressItem, error) {
+func (s *Store) GetRecentlyCompletedSeries(limit int, profile ...string) ([]WatchProgressItem, error) {
 	if limit <= 0 {
 		limit = 10
 	}
+	prof := cleanProfile(profile...)
 
 	query := `
 	SELECT 
-		wp.id, wp.imdb_id, wp.media_type, wp.title, wp.poster_path, wp.backdrop_path,
+		wp.id, wp.profile, wp.imdb_id, wp.media_type, wp.title, wp.poster_path, wp.backdrop_path,
 		wp.season_number, wp.episode_number, wp.episode_title, wp.episode_still_path,
 		wp.position_seconds, wp.duration_seconds, wp.playback_percent, wp.is_completed,
 		wp.torrent_hash, wp.torrent_link, wp.file_index, wp.audio_index, wp.subtitle_index,
@@ -582,15 +604,15 @@ func (s *Store) GetRecentlyCompletedSeries(limit int) ([]WatchProgressItem, erro
 	INNER JOIN (
 		SELECT imdb_id, MAX(last_watched_at) as max_watched
 		FROM watch_progress
-		WHERE media_type = 'tv' AND is_completed = 1
+		WHERE profile = ? AND media_type = 'tv' AND is_completed = 1
 		GROUP BY imdb_id
 	) latest ON wp.imdb_id = latest.imdb_id AND wp.last_watched_at = latest.max_watched
-	WHERE wp.media_type = 'tv' AND wp.is_completed = 1
+	WHERE wp.profile = ? AND wp.media_type = 'tv' AND wp.is_completed = 1
 	ORDER BY wp.last_watched_at DESC
 	LIMIT ?;
 	`
 
-	rows, err := s.db.Query(query, limit)
+	rows, err := s.db.Query(query, prof, prof, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query completed series: %w", err)
 	}
@@ -603,7 +625,7 @@ func (s *Store) GetRecentlyCompletedSeries(limit int) ([]WatchProgressItem, erro
 		var watchedAtStr string
 
 		err := rows.Scan(
-			&item.ID, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
+			&item.ID, &item.Profile, &item.ImdbID, &item.MediaType, &item.Title, &poster, &backdrop,
 			&item.SeasonNumber, &item.EpisodeNumber, &epTitle, &epStill,
 			&item.PositionSeconds, &item.DurationSeconds, &item.PlaybackPercent, &item.IsCompleted,
 			&tHash, &tLink, &item.FileIndex, &item.AudioIndex, &item.SubtitleIndex,
@@ -628,16 +650,18 @@ func (s *Store) GetRecentlyCompletedSeries(limit int) ([]WatchProgressItem, erro
 }
 
 // DeleteItemProgress removes progress for movie or episode
-func (s *Store) DeleteItemProgress(imdbId string, season, episode int) error {
-	query := `DELETE FROM watch_progress WHERE imdb_id = ? AND season_number = ? AND episode_number = ?;`
-	_, err := s.db.Exec(query, imdbId, season, episode)
+func (s *Store) DeleteItemProgress(imdbId string, season, episode int, profile ...string) error {
+	prof := cleanProfile(profile...)
+	query := `DELETE FROM watch_progress WHERE profile = ? AND imdb_id = ? AND season_number = ? AND episode_number = ?;`
+	_, err := s.db.Exec(query, prof, imdbId, season, episode)
 	return err
 }
 
 // DeleteShowProgress removes all progress records for a given imdb_id
-func (s *Store) DeleteShowProgress(imdbId string) error {
-	query := `DELETE FROM watch_progress WHERE imdb_id = ?;`
-	_, err := s.db.Exec(query, imdbId)
+func (s *Store) DeleteShowProgress(imdbId string, profile ...string) error {
+	prof := cleanProfile(profile...)
+	query := `DELETE FROM watch_progress WHERE profile = ? AND imdb_id = ?;`
+	_, err := s.db.Exec(query, prof, imdbId)
 	return err
 }
 
@@ -702,10 +726,11 @@ func (s *Store) GetAudioPreference(imdbID string) (*AudioPreference, error) {
 }
 
 // MarkEpisodeWatched marks a single episode as watched or unwatched
-func (s *Store) MarkEpisodeWatched(imdbId, title, poster, backdrop string, season, episode int, epTitle, epStill string, completed bool) error {
+func (s *Store) MarkEpisodeWatched(imdbId, title, poster, backdrop string, season, episode int, epTitle, epStill string, completed bool, profile ...string) error {
 	if imdbId == "" || season <= 0 || episode <= 0 {
 		return fmt.Errorf("invalid episode parameters")
 	}
+	prof := cleanProfile(profile...)
 
 	completedInt := 0
 	percent := 0.0
@@ -719,24 +744,24 @@ func (s *Store) MarkEpisodeWatched(imdbId, title, poster, backdrop string, seaso
 
 	query := `
 	INSERT INTO watch_progress (
-		imdb_id, media_type, title, poster_path, backdrop_path,
+		profile, imdb_id, media_type, title, poster_path, backdrop_path,
 		season_number, episode_number, episode_title, episode_still_path,
 		position_seconds, duration_seconds, playback_percent, is_completed,
 		last_watched_at
 	) VALUES (
-		?, 'tv', ?, ?, ?,
+		?, ?, 'tv', ?, ?, ?,
 		?, ?, ?, ?,
 		?, ?, ?, ?,
 		CURRENT_TIMESTAMP
 	)
-	ON CONFLICT(imdb_id, season_number, episode_number) DO UPDATE SET
+	ON CONFLICT(profile, imdb_id, season_number, episode_number) DO UPDATE SET
 		is_completed = excluded.is_completed,
 		playback_percent = excluded.playback_percent,
 		position_seconds = excluded.position_seconds,
 		last_watched_at = CURRENT_TIMESTAMP;
 	`
 	_, err := s.db.Exec(query,
-		imdbId, title, poster, backdrop,
+		prof, imdbId, title, poster, backdrop,
 		season, episode, epTitle, epStill,
 		posSec, durSec, percent, completedInt,
 	)
@@ -744,7 +769,7 @@ func (s *Store) MarkEpisodeWatched(imdbId, title, poster, backdrop string, seaso
 }
 
 // MarkSeasonWatched marks all episodes of a season as watched or unwatched
-func (s *Store) MarkSeasonWatched(imdbId, title, poster, backdrop string, season int, episodes []TmdbEpisodeItem, completed bool) error {
+func (s *Store) MarkSeasonWatched(imdbId, title, poster, backdrop string, season int, episodes []TmdbEpisodeItem, completed bool, profile ...string) error {
 	if imdbId == "" || season <= 0 {
 		return fmt.Errorf("invalid season parameters")
 	}
@@ -753,13 +778,13 @@ func (s *Store) MarkSeasonWatched(imdbId, title, poster, backdrop string, season
 		if ep.SeasonNumber != season {
 			continue
 		}
-		_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, season, ep.EpisodeNumber, ep.Name, ep.StillPath, completed)
+		_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, season, ep.EpisodeNumber, ep.Name, ep.StillPath, completed, profile...)
 	}
 	return nil
 }
 
 // MarkAllUpToEpisodeWatched marks all episodes in all seasons strictly prior to the specified episode as watched
-func (s *Store) MarkAllUpToEpisodeWatched(imdbId, title, poster, backdrop string, upToSeason, upToEpisode int, episodes []TmdbEpisodeItem) error {
+func (s *Store) MarkAllUpToEpisodeWatched(imdbId, title, poster, backdrop string, upToSeason, upToEpisode int, episodes []TmdbEpisodeItem, profile ...string) error {
 	if imdbId == "" || upToSeason <= 0 || upToEpisode <= 0 {
 		return fmt.Errorf("invalid up_to parameters")
 	}
@@ -769,27 +794,27 @@ func (s *Store) MarkAllUpToEpisodeWatched(imdbId, title, poster, backdrop string
 			continue
 		}
 		if ep.SeasonNumber < upToSeason || (ep.SeasonNumber == upToSeason && ep.EpisodeNumber < upToEpisode) {
-			_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, ep.SeasonNumber, ep.EpisodeNumber, ep.Name, ep.StillPath, true)
+			_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, ep.SeasonNumber, ep.EpisodeNumber, ep.Name, ep.StillPath, true, profile...)
 		}
 	}
 	return nil
 }
 
 // MarkSeriesWatched marks all episodes of the entire series as watched or unwatched
-func (s *Store) MarkSeriesWatched(imdbId, title, poster, backdrop string, episodes []TmdbEpisodeItem, completed bool) error {
+func (s *Store) MarkSeriesWatched(imdbId, title, poster, backdrop string, episodes []TmdbEpisodeItem, completed bool, profile ...string) error {
 	if imdbId == "" {
 		return fmt.Errorf("imdb_id cannot be empty")
 	}
 
 	for _, ep := range episodes {
-		_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, ep.SeasonNumber, ep.EpisodeNumber, ep.Name, ep.StillPath, completed)
+		_ = s.MarkEpisodeWatched(imdbId, title, poster, backdrop, ep.SeasonNumber, ep.EpisodeNumber, ep.Name, ep.StillPath, completed, profile...)
 	}
 	return nil
 }
 
 // GetSeriesDetailedProgress aggregates watched episode statuses into seasons and overall series progress
-func (s *Store) GetSeriesDetailedProgress(imdbId string, allEps []TmdbEpisodeItem) (*SeriesProgressResponse, error) {
-	epMap, err := s.GetSeriesProgress(imdbId)
+func (s *Store) GetSeriesDetailedProgress(imdbId string, allEps []TmdbEpisodeItem, profile ...string) (*SeriesProgressResponse, error) {
+	epMap, err := s.GetSeriesProgress(imdbId, profile...)
 	if err != nil {
 		return nil, err
 	}
@@ -877,5 +902,26 @@ func (s *Store) GetSeriesDetailedProgress(imdbId string, allEps []TmdbEpisodeIte
 	}
 
 	return resp, nil
+}
+
+func (s *Store) GetProfiles() ([]db.UserProfile, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+	return s.db.GetProfiles()
+}
+
+func (s *Store) CreateProfile(name, icon string, isKids bool) (*db.UserProfile, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+	return s.db.CreateProfile(name, icon, isKids)
+}
+
+func (s *Store) DeleteProfile(id string) error {
+	if s.db == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	return s.db.DeleteProfile(id)
 }
 

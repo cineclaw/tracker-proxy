@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -16,15 +18,19 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"tracker-proxy/config"
 	"tracker-proxy/pkg/aggregator"
 	"tracker-proxy/pkg/auth"
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/home"
 	"tracker-proxy/pkg/hotlist"
 	"tracker-proxy/pkg/models"
+	"tracker-proxy/pkg/monitor"
+	"tracker-proxy/pkg/notifications"
 	"tracker-proxy/pkg/playback"
 	"tracker-proxy/pkg/stream"
 	"tracker-proxy/pkg/tracker"
+	"tracker-proxy/pkg/tracker/rutracker"
 	"tracker-proxy/pkg/transcode"
 	"tracker-proxy/pkg/version"
 )
@@ -36,9 +42,14 @@ type Handler struct {
 	playback   *playback.Store
 	nextUp     *playback.NextUpService
 	auth       *auth.Manager
+	pairing    *auth.PairingManager
 	hotlist    *hotlist.Service
 	home       *home.Service
 	transcode  *transcode.TranscodeEngine
+	pushSvc    *notifications.Service
+	monitorSvc *monitor.Service
+	cfg        *config.Config
+	configPath string
 	sf         singleflight.Group
 }
 
@@ -52,6 +63,10 @@ func NewHandler(
 	nextUpSvc *playback.NextUpService,
 	transcodeEng *transcode.TranscodeEngine,
 	homeSvc *home.Service,
+	pushSvc *notifications.Service,
+	monSvc *monitor.Service,
+	cfg *config.Config,
+	configPath string,
 ) *Handler {
 	return &Handler{
 		aggregator: agg,
@@ -60,18 +75,35 @@ func NewHandler(
 		playback:   playStore,
 		nextUp:     nextUpSvc,
 		auth:       authMgr,
+		pairing:    auth.NewPairingManager(authMgr),
 		hotlist:    hotlistSvc,
 		home:       homeSvc,
 		transcode:  transcodeEng,
+		pushSvc:    pushSvc,
+		monitorSvc: monSvc,
+		cfg:        cfg,
+		configPath: configPath,
 	}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/api/health", h.corsMiddleware(h.handleHealth))
 	mux.HandleFunc("/torrents/health", h.handleHealth)
 	mux.HandleFunc("/api/stream/health", h.handleHealth)
 	mux.HandleFunc("/api/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
 	mux.HandleFunc("/torrents/system/diagnostic", h.corsMiddleware(h.handleSystemDiagnostic))
+
+	// Trackers Management & Cookie API
+	mux.HandleFunc("/api/trackers/status", h.corsMiddleware(h.handleTrackersStatus))
+	mux.HandleFunc("/torrents/trackers/status", h.corsMiddleware(h.handleTrackersStatus))
+	mux.HandleFunc("/api/trackers/rutracker/cookie", h.corsMiddleware(h.handleUpdateRuTrackerCookie))
+	mux.HandleFunc("/torrents/trackers/rutracker/cookie", h.corsMiddleware(h.handleUpdateRuTrackerCookie))
+	mux.HandleFunc("/api/trackers/rutracker/test", h.corsMiddleware(h.handleTestRuTracker))
+	mux.HandleFunc("/torrents/trackers/rutracker/test", h.corsMiddleware(h.handleTestRuTracker))
+	mux.HandleFunc("/api/trackers/rutracker/solve", h.corsMiddleware(h.handleSolveRuTracker))
+	mux.HandleFunc("/torrents/trackers/rutracker/solve", h.corsMiddleware(h.handleSolveRuTracker))
+
 
 	mux.HandleFunc("/api/search", h.corsMiddleware(h.handleJSONSearch))
 	mux.HandleFunc("/api/torrents", h.corsMiddleware(h.handleJSONSearch))
@@ -133,15 +165,37 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/playback/watchlist", h.corsMiddleware(h.handleWatchlist))
 	mux.HandleFunc("/api/playback/watchlist/check", h.corsMiddleware(h.handleWatchlistCheck))
 
+	// User Profiles Management
+	mux.HandleFunc("/api/profiles", h.corsMiddleware(h.handleProfiles))
+	mux.HandleFunc("/api/profiles/", h.corsMiddleware(h.handleProfileByID))
+
+	// Web Push Notifications
+	mux.HandleFunc("/api/notifications/vapid-key", h.corsMiddleware(h.handleNotificationVapidKey))
+	mux.HandleFunc("/api/notifications/subscribe", h.corsMiddleware(h.handleNotificationSubscribe))
+	mux.HandleFunc("/api/notifications/unsubscribe", h.corsMiddleware(h.handleNotificationUnsubscribe))
+	mux.HandleFunc("/api/notifications/test", h.corsMiddleware(h.handleNotificationTest))
+
+	// Ongoing TV Series Subscriptions & Tracking
+	mux.HandleFunc("/api/series/subscription", h.corsMiddleware(h.handleSeriesSubscription))
+	mux.HandleFunc("/api/series/studios", h.corsMiddleware(h.handleSeriesStudios))
+	mux.HandleFunc("/api/series/check-now", h.corsMiddleware(h.handleSeriesCheckNow))
+	mux.HandleFunc("/api/notifications/series/subscription", h.corsMiddleware(h.handleSeriesSubscription))
+	mux.HandleFunc("/api/notifications/series/studios", h.corsMiddleware(h.handleSeriesStudios))
+	mux.HandleFunc("/api/notifications/series/check-now", h.corsMiddleware(h.handleSeriesCheckNow))
+	mux.HandleFunc("/api/series/", h.corsMiddleware(h.handleSeriesIndexerFallback))
+
 	// Jellyfin webhook endpoints (no-op backwards compatibility)
 	mux.HandleFunc("/api/stream/webhook/deleted", h.handleJellyfinItemDeleted)
 	mux.HandleFunc("/webhook/deleted", h.handleJellyfinItemDeleted)
 
-	// Auth endpoints
+	// Auth & Pairing endpoints
 	mux.HandleFunc("/api/auth/login", h.corsMiddleware(h.handleAuthLogin))
 	mux.HandleFunc("/api/auth/verify", h.handleAuthVerify)
 	mux.HandleFunc("/api/auth/logout", h.corsMiddleware(h.handleAuthLogout))
 	mux.HandleFunc("/api/auth/me", h.corsMiddleware(h.handleAuthMe))
+	mux.HandleFunc("/api/auth/pair/init", h.corsMiddleware(h.handlePairInit))
+	mux.HandleFunc("/api/auth/pair/status", h.corsMiddleware(h.handlePairStatus))
+	mux.HandleFunc("/api/auth/pair/approve", h.corsMiddleware(h.handlePairApprove))
 
 	// Torznab endpoints: supports both Jackett-style and direct paths
 	mux.HandleFunc("/api", h.handleTorznab)
@@ -153,9 +207,10 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"service": "tracker-proxy",
-		"version": version.Version,
+		"status":   "ok",
+		"service":  "cineclaw",
+		"name":     "CineClaw Cinema",
+		"version":  version.Version,
 	})
 }
 
@@ -1070,6 +1125,7 @@ func (h *Handler) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req loginRequest
+	req.RememberMe = true // Default to true so API clients & TV clients get long-lived sessions
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -1128,6 +1184,135 @@ func (h *Handler) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type pairInitRequest struct {
+	Code       string `json:"code"`
+	DeviceName string `json:"device_name"`
+}
+
+func (h *Handler) handlePairInit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req pairInitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Code is required"})
+		return
+	}
+
+	_, err := h.pairing.InitPairing(code, req.DeviceName)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"code":    code,
+	})
+}
+
+func (h *Handler) handlePairStatus(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Code parameter required"})
+		return
+	}
+
+	paired, token, username, found := h.pairing.GetStatus(code)
+	w.Header().Set("Content-Type", "application/json")
+	if !found {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"paired": false,
+			"error":  "expired_or_not_found",
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"paired":   paired,
+		"token":    token,
+		"username": username,
+	})
+}
+
+type pairApproveRequest struct {
+	Code string `json:"code"`
+}
+
+func (h *Handler) handlePairApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !h.auth.ValidateRequest(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized: authentication required to approve pairing"})
+		return
+	}
+
+	var req pairApproveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Code is required"})
+		return
+	}
+
+	username := h.auth.GetUsername()
+	token, err := h.pairing.Approve(code, username)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"message":  "paired",
+		"username": username,
+		"token":    token,
+	})
+}
+
+func getProfileFromRequest(r *http.Request) string {
+	if p := strings.TrimSpace(r.URL.Query().Get("profile")); p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(r.Header.Get("X-Profile")); p != "" {
+		return p
+	}
+	return "default"
+}
+
 func (h *Handler) handleHomeFeed(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1143,9 +1328,10 @@ func (h *Handler) handleHomeFeed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	platform := r.URL.Query().Get("platform")
+	profile := getProfileFromRequest(r)
 	forceRefresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh_cache") == "true"
 
-	payload, err := h.home.GetHomeFeed(r.Context(), platform, forceRefresh)
+	payload, err := h.home.GetHomeFeed(r.Context(), platform, profile, forceRefresh)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1170,9 +1356,10 @@ func (h *Handler) handleHubFeed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	platform := r.URL.Query().Get("platform")
+	profile := getProfileFromRequest(r)
 	forceRefresh := r.URL.Query().Get("refresh") == "true"
 
-	payload, err := h.home.GetHomeFeed(r.Context(), platform, forceRefresh)
+	payload, err := h.home.GetHomeFeed(r.Context(), platform, profile, forceRefresh)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1226,8 +1413,11 @@ func (h *Handler) handlePlaybackProgress(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Printf("[playback] SaveProgress: imdb_id=%s, type=%s, s=%d, e=%d, pos=%.1fs, dur=%.1fs, pct=%.1f%%, completed=%v",
-		item.ImdbID, item.MediaType, item.SeasonNumber, item.EpisodeNumber, item.PositionSeconds, item.DurationSeconds, item.PlaybackPercent, item.IsCompleted)
+	if item.Profile == "" {
+		item.Profile = getProfileFromRequest(r)
+	}
+	log.Printf("[playback] SaveProgress: profile=%s, imdb_id=%s, type=%s, s=%d, e=%d, pos=%.1fs, dur=%.1fs, pct=%.1f%%, completed=%v",
+		item.Profile, item.ImdbID, item.MediaType, item.SeasonNumber, item.EpisodeNumber, item.PositionSeconds, item.DurationSeconds, item.PlaybackPercent, item.IsCompleted)
 	if h.playback != nil {
 		if err := h.playback.SaveProgress(&item); err != nil {
 			log.Printf("[playback] SaveProgress ERROR: %v", err)
@@ -1286,10 +1476,11 @@ func (h *Handler) handlePlaybackResume(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
+	profile := getProfileFromRequest(r)
 	var items []playback.WatchProgressItem
 	var err error
 	if h.playback != nil {
-		items, err = h.playback.GetResumeList(limit)
+		items, err = h.playback.GetResumeList(limit, profile)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1309,10 +1500,11 @@ func (h *Handler) handlePlaybackNextUp(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
+	profile := getProfileFromRequest(r)
 	var items []playback.NextUpItem
 	var err error
 	if h.nextUp != nil {
-		items, err = h.nextUp.GetNextUpItems(limit)
+		items, err = h.nextUp.GetNextUpItems(limit, profile)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1329,6 +1521,7 @@ func (h *Handler) handlePlaybackItem(w http.ResponseWriter, r *http.Request) {
 	imdbId := r.URL.Query().Get("imdb_id")
 	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
 	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+	profile := getProfileFromRequest(r)
 
 	if imdbId == "" {
 		http.Error(w, "imdb_id required", http.StatusBadRequest)
@@ -1338,7 +1531,7 @@ func (h *Handler) handlePlaybackItem(w http.ResponseWriter, r *http.Request) {
 	var item *playback.WatchProgressItem
 	var err error
 	if h.playback != nil {
-		item, err = h.playback.GetItemProgress(imdbId, season, episode)
+		item, err = h.playback.GetItemProgress(imdbId, season, episode, profile)
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1356,6 +1549,7 @@ func (h *Handler) handlePlaybackItem(w http.ResponseWriter, r *http.Request) {
 type MarkWatchedRequest struct {
 	ImdbID       string `json:"imdb_id"`
 	Mode         string `json:"mode"` // "episode", "season", "up_to", "series"
+	Profile      string `json:"profile,omitempty"`
 	Title        string `json:"title,omitempty"`
 	PosterPath   string `json:"poster_path,omitempty"`
 	BackdropPath string `json:"backdrop_path,omitempty"`
@@ -1374,6 +1568,7 @@ func (h *Handler) handlePlaybackSeriesProgress(w http.ResponseWriter, r *http.Re
 		http.Error(w, "imdb_id required", http.StatusBadRequest)
 		return
 	}
+	profile := getProfileFromRequest(r)
 
 	var allEps []playback.TmdbEpisodeItem
 	if h.nextUp != nil {
@@ -1381,7 +1576,7 @@ func (h *Handler) handlePlaybackSeriesProgress(w http.ResponseWriter, r *http.Re
 	}
 
 	if h.playback != nil {
-		summary, err := h.playback.GetSeriesDetailedProgress(imdbId, allEps)
+		summary, err := h.playback.GetSeriesDetailedProgress(imdbId, allEps, profile)
 		if err == nil && summary != nil {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(summary)
@@ -1422,6 +1617,11 @@ func (h *Handler) handlePlaybackMarkWatched(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	profile := req.Profile
+	if profile == "" {
+		profile = getProfileFromRequest(r)
+	}
+
 	var allEps []playback.TmdbEpisodeItem
 	if h.nextUp != nil {
 		allEps, _ = h.nextUp.FetchSeriesEpisodes(req.ImdbID)
@@ -1430,13 +1630,13 @@ func (h *Handler) handlePlaybackMarkWatched(w http.ResponseWriter, r *http.Reque
 	var err error
 	switch req.Mode {
 	case "season":
-		err = h.playback.MarkSeasonWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, allEps, req.Completed)
+		err = h.playback.MarkSeasonWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, allEps, req.Completed, profile)
 	case "up_to":
-		err = h.playback.MarkAllUpToEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.UpToSeason, req.UpToEpisode, allEps)
+		err = h.playback.MarkAllUpToEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.UpToSeason, req.UpToEpisode, allEps, profile)
 	case "series":
-		err = h.playback.MarkSeriesWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, allEps, req.Completed)
+		err = h.playback.MarkSeriesWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, allEps, req.Completed, profile)
 	default: // "episode"
-		err = h.playback.MarkEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, req.Episode, req.EpisodeTitle, req.EpisodeStill, req.Completed)
+		err = h.playback.MarkEpisodeWatched(req.ImdbID, req.Title, req.PosterPath, req.BackdropPath, req.Season, req.Episode, req.EpisodeTitle, req.EpisodeStill, req.Completed, profile)
 	}
 
 	if err != nil {
@@ -1450,7 +1650,7 @@ func (h *Handler) handlePlaybackMarkWatched(w http.ResponseWriter, r *http.Reque
 		h.home.InvalidateWatchState()
 	}
 
-	summary, _ := h.playback.GetSeriesDetailedProgress(req.ImdbID, allEps)
+	summary, _ := h.playback.GetSeriesDetailedProgress(req.ImdbID, allEps, profile)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
@@ -1462,6 +1662,7 @@ func (h *Handler) handlePlaybackDelete(w http.ResponseWriter, r *http.Request) {
 	imdbId := r.URL.Query().Get("imdb_id")
 	season, _ := strconv.Atoi(r.URL.Query().Get("season"))
 	episode, _ := strconv.Atoi(r.URL.Query().Get("episode"))
+	profile := getProfileFromRequest(r)
 
 	if imdbId == "" {
 		http.Error(w, "imdb_id required", http.StatusBadRequest)
@@ -1470,9 +1671,9 @@ func (h *Handler) handlePlaybackDelete(w http.ResponseWriter, r *http.Request) {
 
 	if h.playback != nil {
 		if season == 0 && episode == 0 {
-			_ = h.playback.DeleteShowProgress(imdbId)
+			_ = h.playback.DeleteShowProgress(imdbId, profile)
 		} else {
-			_ = h.playback.DeleteItemProgress(imdbId, season, episode)
+			_ = h.playback.DeleteItemProgress(imdbId, season, episode, profile)
 		}
 		if h.home != nil {
 			h.home.InvalidateWatchState()
@@ -1488,9 +1689,11 @@ func (h *Handler) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	profile := getProfileFromRequest(r)
+
 	switch r.Method {
 	case http.MethodGet:
-		items, err := h.playback.GetWatchlist(r.Context())
+		items, err := h.playback.GetWatchlist(r.Context(), profile)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1507,7 +1710,10 @@ func (h *Handler) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		if err := h.playback.AddToWatchlist(r.Context(), item); err != nil {
+		if item.Profile == "" {
+			item.Profile = profile
+		}
+		if err := h.playback.AddToWatchlist(r.Context(), item, item.Profile); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1531,7 +1737,7 @@ func (h *Handler) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "imdb_id required", http.StatusBadRequest)
 			return
 		}
-		if err := h.playback.RemoveFromWatchlist(r.Context(), imdbID); err != nil {
+		if err := h.playback.RemoveFromWatchlist(r.Context(), imdbID, profile); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1558,7 +1764,8 @@ func (h *Handler) handleWatchlistCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inList, err := h.playback.IsInWatchlist(r.Context(), imdbID)
+	profile := getProfileFromRequest(r)
+	inList, err := h.playback.IsInWatchlist(r.Context(), imdbID, profile)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1660,9 +1867,15 @@ func (h *Handler) handleTranscodeSegment(w http.ResponseWriter, r *http.Request)
 				segNum, _ = strconv.Atoi(matches[1])
 			}
 			startSec := float64(segNum) * 3.0
-			log.Printf("[Transcode] Reviving expired/missing session %s at seg %d (start=%.1fs)", sessionID, segNum, startSec)
+			durationSec := 7200.0
+			if h.mounter != nil {
+				if dur := h.mounter.GetStreamDuration(r.Context(), hash, fileIdx); dur > 0 {
+					durationSec = dur
+				}
+			}
+			log.Printf("[Transcode] Reviving expired/missing session %s at seg %d (start=%.1fs, dur=%.1fs)", sessionID, segNum, startSec, durationSec)
 			var err error
-			sess, err = h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, 7200.0, customID)
+			sess, err = h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, durationSec, customID)
 			if err != nil {
 				log.Printf("[Transcode] Failed to revive session %s: %v", sessionID, err)
 			}
@@ -1753,4 +1966,485 @@ func (h *Handler) handleTranscodePlaylist(w http.ResponseWriter, r *http.Request
 	_, _ = w.Write([]byte(vodPlaylist))
 }
 
+type UpdateCookieRequest struct {
+	Cookie    string `json:"cookie"`
+	UserAgent string `json:"user_agent"`
+}
 
+type TrackerStatusItem struct {
+	Name           string `json:"name"`
+	Enabled        bool   `json:"enabled"`
+	BaseURL        string `json:"base_url"`
+	Username       string `json:"username,omitempty"`
+	Status         string `json:"status"` // "online", "challenge_required", "disabled", "error"
+	HasCookie      bool   `json:"has_cookie"`
+	HasCfClearance bool   `json:"has_cf_clearance"`
+	HasSession     bool   `json:"has_session"`
+	UserAgent      string `json:"user_agent,omitempty"`
+	MaskedCookie   string `json:"masked_cookie,omitempty"`
+}
+
+type TrackersStatusResponse struct {
+	RuTor     TrackerStatusItem `json:"rutor"`
+	NNMClub   TrackerStatusItem `json:"nnmclub"`
+	RuTracker TrackerStatusItem `json:"rutracker"`
+}
+
+func (h *Handler) handleTrackersStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	nnmUser := ""
+	if h.cfg != nil {
+		nnmUser = h.cfg.Trackers.NNMClub.Username
+	}
+
+	rutrackerUser := ""
+	if h.cfg != nil {
+		rutrackerUser = h.cfg.Trackers.RuTracker.Username
+	}
+
+	resp := TrackersStatusResponse{
+		RuTor: TrackerStatusItem{
+			Name:    "rutor",
+			Enabled: true,
+			BaseURL: "https://rutor.info",
+			Status:  "online",
+		},
+		NNMClub: TrackerStatusItem{
+			Name:     "nnmclub",
+			Enabled:  true,
+			BaseURL:  "https://nnmclub.to",
+			Username: nnmUser,
+			Status:   "online",
+		},
+		RuTracker: TrackerStatusItem{
+			Name:     "rutracker",
+			Enabled:  true,
+			BaseURL:  "https://rutracker.org",
+			Username: rutrackerUser,
+			Status:   "challenge_required",
+		},
+	}
+
+	if rt := h.aggregator.GetTracker("rutracker"); rt != nil {
+		if rtt, ok := rt.(*rutracker.Tracker); ok {
+			st := rtt.GetStatus()
+			resp.RuTracker.Enabled = st.Enabled
+			resp.RuTracker.BaseURL = st.BaseURL
+			if st.Username != "" {
+				resp.RuTracker.Username = st.Username
+			}
+			resp.RuTracker.HasCookie = st.HasCookie
+			resp.RuTracker.HasCfClearance = st.HasCfClearance
+			resp.RuTracker.HasSession = st.HasSession
+			resp.RuTracker.UserAgent = st.UserAgent
+			resp.RuTracker.MaskedCookie = st.MaskedCookie
+			if st.HasCookie && st.HasCfClearance {
+				resp.RuTracker.Status = "online"
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleUpdateRuTrackerCookie(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req UpdateCookieRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON payload: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	req.Cookie = strings.TrimSpace(req.Cookie)
+	req.UserAgent = strings.TrimSpace(req.UserAgent)
+
+	rt := h.aggregator.GetTracker("rutracker")
+	if rt == nil {
+		http.Error(w, "rutracker tracker not loaded", http.StatusNotFound)
+		return
+	}
+
+	rtt, ok := rt.(*rutracker.Tracker)
+	if !ok {
+		http.Error(w, "invalid rutracker instance", http.StatusInternalServerError)
+		return
+	}
+
+	// 1. Update in memory
+	rtt.UpdateCookieAndUserAgent(req.Cookie, req.UserAgent)
+
+	// 2. Persist to config.yaml if available
+	if h.cfg != nil {
+		h.cfg.Trackers.RuTracker.Cookie = req.Cookie
+		if req.UserAgent != "" {
+			h.cfg.Trackers.RuTracker.UserAgent = req.UserAgent
+		}
+		if err := h.cfg.Save(h.configPath); err != nil {
+			log.Printf("[trackers] Warning: failed to save updated config to %s: %v", h.configPath, err)
+		} else {
+			log.Printf("[trackers] Saved updated RuTracker cookies to %s", h.configPath)
+		}
+	}
+
+	// 3. Perform test connection
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	statusCode, testMsg, err := rtt.TestConnection(ctx)
+	isOk := err == nil && statusCode == http.StatusOK && !strings.Contains(testMsg, "Challenge")
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":          isOk,
+		"status_code": statusCode,
+		"message":     testMsg,
+		"status":      rtt.GetStatus(),
+	})
+}
+
+func (h *Handler) handleTestRuTracker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rt := h.aggregator.GetTracker("rutracker")
+	if rt == nil {
+		http.Error(w, "rutracker tracker not loaded", http.StatusNotFound)
+		return
+	}
+
+	rtt, ok := rt.(*rutracker.Tracker)
+	if !ok {
+		http.Error(w, "invalid rutracker instance", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	statusCode, testMsg, err := rtt.TestConnection(ctx)
+	isOk := err == nil && statusCode == http.StatusOK && !strings.Contains(testMsg, "Challenge")
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":          isOk,
+		"status_code": statusCode,
+		"message":     testMsg,
+		"status":      rtt.GetStatus(),
+	})
+}
+
+func (h *Handler) handleSolveRuTracker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rt := h.aggregator.GetTracker("rutracker")
+	if rt == nil {
+		http.Error(w, "rutracker tracker not loaded", http.StatusNotFound)
+		return
+	}
+
+	rtt, ok := rt.(*rutracker.Tracker)
+	if !ok {
+		http.Error(w, "invalid rutracker instance", http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
+	defer cancel()
+
+	err := rtt.EnsureClearance(ctx)
+	st := rtt.GetStatus()
+	isOk := err == nil && st.HasCfClearance
+
+	msg := "Обход Cloudflare Turnstile успешно завершен через FlareSolverr!"
+	statusCode := http.StatusOK
+	if err != nil {
+		msg = fmt.Sprintf("FlareSolverr не смог решить капчу: %v", err)
+		statusCode = http.StatusBadGateway
+	} else if !st.HasSession && st.Username != "" {
+		msg = "Clearance получен, но вход не удался (проверьте логин/пароль)"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if !isOk {
+		w.WriteHeader(statusCode)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":          isOk,
+		"status_code": statusCode,
+		"message":     msg,
+		"status":      st,
+	})
+}
+
+// --- Web Push Notifications & Series Tracking ---
+
+func (h *Handler) handleNotificationVapidKey(w http.ResponseWriter, r *http.Request) {
+	if h.pushSvc == nil {
+		http.Error(w, "push notifications service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	key := h.pushSvc.GetVAPIDPublicKey()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"public_key": key,
+	})
+}
+
+func (h *Handler) handleNotificationSubscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.pushSvc == nil {
+		http.Error(w, "push notifications service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var sub notifications.PushSubscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if sub.Endpoint == "" || sub.P256dh == "" || sub.Auth == "" {
+		http.Error(w, "endpoint, p256dh, and auth are required", http.StatusBadRequest)
+		return
+	}
+
+	if sub.Profile == "" {
+		sub.Profile = getProfileFromRequest(r)
+	}
+	if sub.UserAgent == "" {
+		sub.UserAgent = r.UserAgent()
+	}
+
+	if err := h.pushSvc.Subscribe(sub); err != nil {
+		http.Error(w, "failed to save subscription: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func (h *Handler) handleNotificationUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.pushSvc == nil {
+		http.Error(w, "push notifications service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Endpoint != "" {
+		_ = h.pushSvc.Unsubscribe(req.Endpoint)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func (h *Handler) handleNotificationTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.pushSvc == nil {
+		http.Error(w, "push notifications service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Title   string `json:"title"`
+		Body    string `json:"body"`
+		Profile string `json:"profile"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	title := req.Title
+	if title == "" {
+		title = "CineClaw Cinema"
+	}
+	body := req.Body
+	if body == "" {
+		body = "Тестовое уведомление успешно получено!"
+	}
+	profile := req.Profile
+	if profile == "" {
+		profile = getProfileFromRequest(r)
+	}
+
+	payload := notifications.NotificationPayload{
+		Title: title,
+		Body:  body,
+		Icon:  "/icons/icon-192x192.png",
+		Badge: "/icons/icon-192x192.png",
+		Tag:   "test_notification",
+		Data: map[string]interface{}{
+			"url": "/",
+		},
+	}
+
+	sent, err := h.pushSvc.SendNotification(r.Context(), payload, profile)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"sent_count": sent,
+	})
+}
+
+func (h *Handler) handleSeriesSubscription(w http.ResponseWriter, r *http.Request) {
+	if h.monitorSvc == nil {
+		http.Error(w, "monitor service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	profile := getProfileFromRequest(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		imdbID := r.URL.Query().Get("imdb_id")
+		if imdbID == "" {
+			http.Error(w, "imdb_id required", http.StatusBadRequest)
+			return
+		}
+		if p := r.URL.Query().Get("profile"); p != "" {
+			profile = p
+		}
+
+		sub, err := h.monitorSvc.GetSubscription(imdbID, profile)
+		if err != nil {
+			http.Error(w, "failed to get subscription: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sub)
+
+	case http.MethodPost:
+		var sub monitor.SeriesSubscription
+		if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+			http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if sub.ImdbID == "" {
+			http.Error(w, "imdb_id required", http.StatusBadRequest)
+			return
+		}
+		if sub.Profile == "" {
+			sub.Profile = profile
+		}
+
+		if err := h.monitorSvc.SetSubscription(sub); err != nil {
+			http.Error(w, "failed to set subscription: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+		})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *Handler) handleSeriesStudios(w http.ResponseWriter, r *http.Request) {
+	studios := tracker.ListKnownStudios()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"studios": studios,
+	})
+}
+
+func (h *Handler) handleSeriesCheckNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.monitorSvc == nil {
+		http.Error(w, "monitor service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	imdbID := r.URL.Query().Get("imdb_id")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var detected []monitor.DetectedRelease
+	var err error
+	if imdbID != "" {
+		detected, err = h.monitorSvc.CheckSeries(ctx, imdbID)
+	} else {
+		detected, err = h.monitorSvc.CheckAll(ctx)
+	}
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":        true,
+		"detected_count": len(detected),
+		"releases":       detected,
+	})
+}
+
+func (h *Handler) handleSeriesIndexerFallback(w http.ResponseWriter, r *http.Request) {
+	_, _, indexerURL := h.mounter.GetServiceURLs()
+	if indexerURL == "" {
+		indexerURL = "http://imdb-indexer:8090"
+	}
+	target, err := url.Parse(indexerURL)
+	if err != nil {
+		http.Error(w, "bad indexer url", http.StatusInternalServerError)
+		return
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ServeHTTP(w, r)
+}

@@ -300,6 +300,22 @@ func (s *Store) SetTopicHash(tracker, topicID, hash string) error {
 	})
 }
 
+// DeleteTopicHash removes the cached InfoHash for a given tracker and topic ID.
+func (s *Store) DeleteTopicHash(tracker, topicID string) error {
+	if s == nil || s.db == nil || tracker == "" || topicID == "" {
+		return nil
+	}
+
+	key := []byte(fmt.Sprintf("%s:%s", strings.ToLower(tracker), topicID))
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(hashBucketName)
+		if b == nil {
+			return nil
+		}
+		return b.Delete(key)
+	})
+}
+
 func (s *Store) cleanupWorker(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

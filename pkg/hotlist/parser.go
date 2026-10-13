@@ -14,8 +14,8 @@ var (
 	// Fallback standalone year: 1900..2035 bounded by word boundaries
 	standaloneYearRegex = regexp.MustCompile(`\b(19\d{2}|20\d{2})\b`)
 
-	// Matches season tags like [S01], [S03], [02x01-07], [Сезон 1], [01-04 из 04]
-	seasonRegex = regexp.MustCompile(`(?i)\[(?:S(\d+)|(\d+)x(\d+(?:-\d+)?)|сезон\s*(\d+)|(\d+-\d+\s*из\s*\d+))[^\]]*\]`)
+	// Matches season tags like [S01], [S03], [02x01-07], [Сезон 1], [01-04 из 04] (supports Latin and Cyrillic x/х)
+	seasonRegex = regexp.MustCompile(`(?i)\[(?:S(\d+)|(\d+)[xхXХ](\d+(?:-\d+)?)|сезон\s*(\d+)|(\d+-\d+\s*из\s*\d+))[^\]]*\]`)
 
 	// Matches season/episode text in title parts like "Сезон: 1", "Сезоны 1-5", "Серии 1-8"
 	seasonTextRegex = regexp.MustCompile(`(?i)\b(?:сезон\S*|сери\S*)\s*[:\s]*\d+`)

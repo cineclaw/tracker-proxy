@@ -89,12 +89,12 @@ func (s *NextUpService) FetchSeriesEpisodes(imdbId string) ([]TmdbEpisodeItem, e
 }
 
 // GetNextUpItems finds the next episode for recently completed episodes of series
-func (s *NextUpService) GetNextUpItems(limit int) ([]NextUpItem, error) {
+func (s *NextUpService) GetNextUpItems(limit int, profile ...string) ([]NextUpItem, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 
-	completedSeries, err := s.store.GetRecentlyCompletedSeries(limit * 2)
+	completedSeries, err := s.store.GetRecentlyCompletedSeries(limit*2, profile...)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (s *NextUpService) GetNextUpItems(limit int) ([]NextUpItem, error) {
 	var nextUpList []NextUpItem
 	for _, lastEp := range completedSeries {
 		// Check if there is already an in-progress episode for this show
-		inProgress, _ := s.store.GetResumeList(50)
+		inProgress, _ := s.store.GetResumeList(50, profile...)
 		hasInProgress := false
 		for _, ip := range inProgress {
 			if ip.ImdbID == lastEp.ImdbID {

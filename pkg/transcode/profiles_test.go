@@ -22,7 +22,7 @@ func TestAvailableProfiles(t *testing.T) {
 	}
 
 	p720 := GetProfile("720p")
-	if p720.MaxHeight != 720 || p720.BitrateKbps != 2800 {
+	if p720.MaxHeight != 720 || p720.BitrateKbps != 5000 {
 		t.Errorf("unexpected 720p profile: %+v", p720)
 	}
 
@@ -63,8 +63,14 @@ func TestBuildFFmpegArgs(t *testing.T) {
 	if !strings.Contains(cmdStr, "scale=w=-2:h=min(720\\,ih)") {
 		t.Errorf("missing scale filter: %s", cmdStr)
 	}
-	if !strings.Contains(cmdStr, "-b:v 2800k") {
+	if !strings.Contains(cmdStr, "-b:v 5000k") {
 		t.Errorf("missing bitrate: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-profile:v high") {
+		t.Errorf("missing high profile: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-tune film") {
+		t.Errorf("missing film tuning: %s", cmdStr)
 	}
 	if !strings.Contains(cmdStr, "-f hls") {
 		t.Errorf("missing hls format: %s", cmdStr)
@@ -95,6 +101,30 @@ func TestBuildFFmpegArgsDirectRemux(t *testing.T) {
 	}
 	if !strings.Contains(cmdStr, "-b:a 256k") {
 		t.Errorf("expected -b:a 256k, got: %s", cmdStr)
+	}
+}
+
+func TestBuildFFmpegArgsDirectRemuxSeek(t *testing.T) {
+	profile := GetProfile("direct")
+	args := BuildFFmpegArgs(
+		"http://localhost:8092/torr/stream/video.mkv?link=abc&index=1&play",
+		0,
+		60.0,
+		20,
+		profile,
+		"/tmp/out/index.m3u8",
+		"/tmp/out/seg_%04d.ts",
+	)
+
+	cmdStr := strings.Join(args, " ")
+	if !strings.Contains(cmdStr, "-noaccurate_seek") {
+		t.Errorf("expected -noaccurate_seek for direct remux seek, got: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-ss 60.000") {
+		t.Errorf("expected -ss 60.000, got: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-output_ts_offset 60.000") {
+		t.Errorf("expected -output_ts_offset 60.000, got: %s", cmdStr)
 	}
 }
 

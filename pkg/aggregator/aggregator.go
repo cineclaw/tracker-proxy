@@ -10,6 +10,7 @@ import (
 
 	"tracker-proxy/pkg/cache"
 	"tracker-proxy/pkg/models"
+	"tracker-proxy/pkg/swarm"
 	"tracker-proxy/pkg/tracker"
 )
 
@@ -17,6 +18,7 @@ type Aggregator struct {
 	trackers   []tracker.Tracker
 	resolvers  map[string]tracker.InfoHashResolver
 	cacheStore *cache.Store
+	swarmSvc   *swarm.Service
 	timeout    time.Duration
 }
 
@@ -34,14 +36,41 @@ func New(trackers []tracker.Tracker, cacheStore *cache.Store, timeout time.Durat
 		trackers:   trackers,
 		resolvers:  resolvers,
 		cacheStore: cacheStore,
+		swarmSvc:   swarm.NewService(nil, 1200*time.Millisecond, 15*time.Minute),
 		timeout:    timeout,
 	}
+}
+
+// SetSwarmService overrides the swarm verification service.
+func (a *Aggregator) SetSwarmService(svc *swarm.Service) {
+	a.swarmSvc = svc
+}
+
+// GetSwarmService returns the swarm verification service.
+func (a *Aggregator) GetSwarmService() *swarm.Service {
+	return a.swarmSvc
 }
 
 // SetCache allows setting or updating the cache store after initialization.
 func (a *Aggregator) SetCache(cs *cache.Store) {
 	a.cacheStore = cs
 }
+
+// GetTrackers returns all loaded tracker instances.
+func (a *Aggregator) GetTrackers() []tracker.Tracker {
+	return a.trackers
+}
+
+// GetTracker finds a specific tracker by name (e.g. "rutracker").
+func (a *Aggregator) GetTracker(name string) tracker.Tracker {
+	for _, tr := range a.trackers {
+		if strings.EqualFold(tr.Name(), name) {
+			return tr
+		}
+	}
+	return nil
+}
+
 
 func (a *Aggregator) Search(ctx context.Context, query models.SearchQuery) []models.TorrentResult {
 	if strings.TrimSpace(query.Query) == "" {
@@ -89,9 +118,22 @@ func (a *Aggregator) Search(ctx context.Context, query models.SearchQuery) []mod
 	// Cross-tracker deduplication and merging
 	allResults = DeduplicateAndMerge(ctx, allResults, a.cacheStore, a.resolvers, 4*time.Second)
 
-	// Sort by seeds descending
+	// Enrich with real-time BEP 15 UDP swarm verification & speed potential
+	if a.swarmSvc != nil {
+		allResults = a.swarmSvc.EnrichResults(ctx, allResults)
+	}
+
+	// Sort: Active healthy swarms first, dead swarms sink to the bottom, then by Seeds descending
 	sort.Slice(allResults, func(i, j int) bool {
-		return allResults[i].Seeds > allResults[j].Seeds
+		iDead := allResults[i].SwarmHealth == "dead" || allResults[i].Seeds == 0
+		jDead := allResults[j].SwarmHealth == "dead" || allResults[j].Seeds == 0
+		if iDead != jDead {
+			return !iDead // non-dead before dead
+		}
+		if allResults[i].Seeds != allResults[j].Seeds {
+			return allResults[i].Seeds > allResults[j].Seeds
+		}
+		return allResults[i].SpeedPotential > allResults[j].SpeedPotential
 	})
 
 	if query.Limit > 0 && len(allResults) > query.Limit {
@@ -131,5 +173,40 @@ func (a *Aggregator) ResolveInfoHash(ctx context.Context, trackerName, id string
 	}
 
 	return clean, nil
+}
+
+// ResolveInfoHashFresh forces a live fetch from the tracker, bypassing and updating the bbolt cache.
+func (a *Aggregator) ResolveInfoHashFresh(ctx context.Context, trackerName, id string) (string, error) {
+	if trackerName == "" || id == "" {
+		return "", nil
+	}
+
+	if a.cacheStore != nil {
+		_ = a.cacheStore.DeleteTopicHash(trackerName, id)
+	}
+
+	resolver, ok := a.resolvers[strings.ToLower(trackerName)]
+	if !ok {
+		return "", nil
+	}
+
+	hash, err := resolver.FetchInfoHash(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	clean := strings.ToLower(strings.TrimSpace(hash))
+	if clean != "" && a.cacheStore != nil {
+		_ = a.cacheStore.SetTopicHash(trackerName, id, clean)
+	}
+
+	return clean, nil
+}
+
+// InvalidateTopicHash removes the cached topic hash from bbolt cache.
+func (a *Aggregator) InvalidateTopicHash(trackerName, id string) {
+	if a.cacheStore != nil && trackerName != "" && id != "" {
+		_ = a.cacheStore.DeleteTopicHash(trackerName, id)
+	}
 }
 

@@ -22,8 +22,9 @@ var (
 
 const (
 	CookieName    = "cineclaw_session"
-	DefaultTTL    = 30 * 24 * time.Hour // 30 days
-	ShortTTL      = 24 * time.Hour      // 1 day (if not remember me)
+	DefaultTTL    = 180 * 24 * time.Hour // 180 days (default for cinema installations)
+	ShortTTL      = 30 * 24 * time.Hour  // 30 days
+	DeviceTTL     = 365 * 24 * time.Hour // 1 year for paired TV / media players
 )
 
 type Config struct {
@@ -239,6 +240,18 @@ func (m *Manager) createToken(username string, expiresAt time.Time) (string, err
 	sig := m.sign(fmt.Sprintf("%s:%d:%s", username, expUnix, nonce))
 
 	return fmt.Sprintf("%s.%d.%s.%s", uB64, expUnix, nonce, hex.EncodeToString(sig)), nil
+}
+
+func (m *Manager) CreateDeviceToken(username string) (string, time.Time, error) {
+	if !m.cfg.Enabled {
+		return "anonymous", time.Now().Add(DeviceTTL), nil
+	}
+	expiresAt := time.Now().Add(DeviceTTL)
+	token, err := m.createToken(username, expiresAt)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return token, expiresAt, nil
 }
 
 func (m *Manager) sign(payload string) []byte {

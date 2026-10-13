@@ -36,7 +36,7 @@ func NewEngine(torrURL, baseDir string) *TranscodeEngine {
 		sessions:    make(map[string]*TranscodeSession),
 		torrURL:     torrURL,
 		baseDir:     baseDir,
-		idleTimeout: 90 * time.Second,
+		idleTimeout: 20 * time.Minute,
 		stopChan:    make(chan struct{}),
 	}
 

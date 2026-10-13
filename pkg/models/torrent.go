@@ -35,7 +35,12 @@ type TorrentResult struct {
 	InfoHash    string          `json:"info_hash,omitempty"`
 	Seasons     []int           `json:"seasons,omitempty"`
 	IsComplete  bool            `json:"is_complete,omitempty"`
-	Resolution  string          `json:"resolution,omitempty"`
+	Resolution     string          `json:"resolution,omitempty"`
+	RealSeeds      int             `json:"real_seeds,omitempty"`
+	SeedsVerified  bool            `json:"seeds_verified"`
+	Completed      int             `json:"completed,omitempty"`
+	SwarmHealth    string          `json:"swarm_health,omitempty"`
+	SpeedPotential int             `json:"speed_potential,omitempty"`
 }
 
 // SearchQuery represents the search parameters.
