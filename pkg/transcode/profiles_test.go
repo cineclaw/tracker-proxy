@@ -104,6 +104,30 @@ func TestBuildFFmpegArgsDirectRemux(t *testing.T) {
 	}
 }
 
+func TestBuildFFmpegArgsDirectRemuxSeek(t *testing.T) {
+	profile := GetProfile("direct")
+	args := BuildFFmpegArgs(
+		"http://localhost:8092/torr/stream/video.mkv?link=abc&index=1&play",
+		0,
+		60.0,
+		20,
+		profile,
+		"/tmp/out/index.m3u8",
+		"/tmp/out/seg_%04d.ts",
+	)
+
+	cmdStr := strings.Join(args, " ")
+	if !strings.Contains(cmdStr, "-noaccurate_seek") {
+		t.Errorf("expected -noaccurate_seek for direct remux seek, got: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-ss 60.000") {
+		t.Errorf("expected -ss 60.000, got: %s", cmdStr)
+	}
+	if !strings.Contains(cmdStr, "-output_ts_offset 60.000") {
+		t.Errorf("expected -output_ts_offset 60.000, got: %s", cmdStr)
+	}
+}
+
 func TestGenerateVODPlaylist(t *testing.T) {
 	pl := GenerateVODPlaylist("test_sess", 10.0, 3.0)
 	if !strings.Contains(pl, "#EXT-X-PLAYLIST-TYPE:VOD") {

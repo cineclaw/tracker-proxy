@@ -928,12 +928,21 @@ func (s *TorrStreamService) HandleJellyfinItemDeleted(ctx context.Context, paylo
 // ScoreCandidate evaluates how well a torrent candidate matches the intended title, metadata, and season.
 func ScoreCandidate(c *models.TorrentResult, meta *IndexerMeta, season int) int {
 	score := 0
-	// Seeds contribution: seeders reflect swarm health and download speed
-	if c.Seeds > 0 {
+
+	// Swarm vitality & verified seeders
+	if (c.SeedsVerified && c.Seeds == 0) || c.SwarmHealth == "dead" {
+		score -= 5000 // Confirmed dead/ghost swarm, strictly avoid picking for playback
+	} else if c.Seeds > 0 {
 		if c.Seeds > 3000 {
 			score += 3000 + (c.Seeds-3000)/10
 		} else {
 			score += c.Seeds
+		}
+		if c.SeedsVerified {
+			score += 150 // Verified live peers bonus
+		}
+		if c.SpeedPotential > 0 {
+			score += c.SpeedPotential * 2 // Bandwidth & contention score
 		}
 	}
 

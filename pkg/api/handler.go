@@ -1867,9 +1867,15 @@ func (h *Handler) handleTranscodeSegment(w http.ResponseWriter, r *http.Request)
 				segNum, _ = strconv.Atoi(matches[1])
 			}
 			startSec := float64(segNum) * 3.0
-			log.Printf("[Transcode] Reviving expired/missing session %s at seg %d (start=%.1fs)", sessionID, segNum, startSec)
+			durationSec := 7200.0
+			if h.mounter != nil {
+				if dur := h.mounter.GetStreamDuration(r.Context(), hash, fileIdx); dur > 0 {
+					durationSec = dur
+				}
+			}
+			log.Printf("[Transcode] Reviving expired/missing session %s at seg %d (start=%.1fs, dur=%.1fs)", sessionID, segNum, startSec, durationSec)
 			var err error
-			sess, err = h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, 7200.0, customID)
+			sess, err = h.transcode.GetOrCreateSession(hash, fileIdx, profile, audioIdx, startSec, durationSec, customID)
 			if err != nil {
 				log.Printf("[Transcode] Failed to revive session %s: %v", sessionID, err)
 			}

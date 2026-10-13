@@ -141,6 +141,11 @@ func BuildFFmpegArgs(
 
 	// Fast keyframe input seek via HTTP range before -i
 	if startSeconds > 0 {
+		if profile.ID == "direct" || (profile.IsDirect && profile.ID != "http_direct") {
+			// For stream-copy remux, avoid trimming audio before the nearest video keyframe.
+			// This keeps audio and video strictly aligned from the first demuxed keyframe packet.
+			args = append(args, "-noaccurate_seek")
+		}
 		args = append(args, "-ss", fmt.Sprintf("%.3f", startSeconds))
 	}
 
